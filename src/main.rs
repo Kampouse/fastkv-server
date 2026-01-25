@@ -149,8 +149,11 @@ async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl 
                 for part in rest {
                     if part.nonce == first.nonce {
                         if let Some(part_content) = part.content {
-                            full_content
-                                [part.offset as usize..part.offset as usize + part_content.len()]
+                            let right_bound = std::cmp::min(
+                                full_content.len(),
+                                part.offset as usize + part_content.len(),
+                            );
+                            full_content[part.offset as usize..part.offset as usize + right_bound]
                                 .copy_from_slice(&part_content);
                             num_parts += 1;
                         }
