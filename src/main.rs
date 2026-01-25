@@ -155,7 +155,7 @@ async fn get_file(request: HttpRequest, app_state: web::Data<AppState>) -> impl 
                                 full_content.len(),
                                 part.offset as usize + part_content.len(),
                             );
-                            full_content[part.offset as usize..part.offset as usize + right_bound]
+                            full_content[part.offset as usize..right_bound]
                                 .copy_from_slice(&part_content);
                             num_parts += 1;
                         }
