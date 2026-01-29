@@ -76,7 +76,7 @@ async fn main() -> std::io::Result<()> {
             .service(query_kv_handler)
             .service(reverse_kv_handler)
     })
-    .bind(format!("127.0.0.1:{}", env::var("PORT").unwrap()))?
+    .bind(format!("0.0.0.0:{}", env::var("PORT").unwrap()))?
     .run()
     .await?;
 
