@@ -2,8 +2,8 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::statement::prepared::PreparedStatement;
 
-use crate::models::{AccountsParams, ByKeyParams, CountParams, HistoryParams, KeysParams, KvEntry, KvHistoryRow, KvKeyRow, KvPredecessorRow, KvRow, QueryParams, ReverseParams};
-use crate::queries::build_prefix_query;
+use crate::models::{AccountsParams, ByKeyParams, CountParams, HistoryParams, KeysParams, KvEntry, KvHistoryRow, KvKeyRow, KvPredecessorRow, KvRow, QueryParams, ReverseParams, MAX_COUNT_SCAN, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN};
+use crate::queries::{build_prefix_query, build_count_query, build_keys_prefix_query};
 use fastnear_primitives::types::ChainId;
 use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
@@ -297,16 +297,7 @@ impl ScyllaDb {
         params: &KeysParams,
     ) -> anyhow::Result<Vec<String>> {
         let mut rows_stream = if let Some(prefix) = &params.key_prefix {
-            let prefix_start = prefix.to_string();
-            let prefix_end = format!("{}\u{ff}", prefix);
-            let query_text = format!(
-                "SELECT key FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key >= ? AND key < ?",
-                self.table_name
-            );
-            let mut stmt = scylla::statement::Statement::new(query_text);
-            stmt.set_consistency(scylla::frame::types::Consistency::LocalOne);
-            stmt.set_request_timeout(Some(std::time::Duration::from_secs(10)));
-
+            let (stmt, prefix_start, prefix_end) = build_keys_prefix_query(prefix, &self.table_name);
             self.scylla_session
                 .query_iter(
                     stmt,
@@ -372,7 +363,7 @@ impl ScyllaDb {
         let target_count = params.offset + params.limit;
 
         while let Some(row_result) = rows_stream.next().await {
-            if seen.len() >= 100_000 {
+            if seen.len() >= MAX_DEDUP_SCAN {
                 break;
             }
 
@@ -425,7 +416,7 @@ impl ScyllaDb {
         let mut seen = HashSet::new();
 
         while let Some(row_result) = rows_stream.next().await {
-            if seen.len() >= 1_000_000 {
+            if seen.len() >= MAX_COUNT_SCAN {
                 break;
             }
 
@@ -529,7 +520,7 @@ impl ScyllaDb {
 
         while let Some(row_result) = rows_stream.next().await {
             // Safety limit: stop if we've seen too many unique predecessors
-            if seen_predecessors.len() >= 100_000 {
+            if seen_predecessors.len() >= MAX_DEDUP_SCAN {
                 break;
             }
 
@@ -581,7 +572,6 @@ impl ScyllaDb {
         &self,
         params: &HistoryParams,
     ) -> anyhow::Result<Vec<KvEntry>> {
-        const MAX_HISTORY_SCAN: usize = 10_000;
 
         // Query s_kv table for full history using streaming
         // Note: s_kv has clustering order by current_account_id, key, block_height, order_id
@@ -652,18 +642,8 @@ impl ScyllaDb {
         params: &CountParams,
     ) -> anyhow::Result<(usize, bool)> {
         // Primary path: Use COUNT(*) for efficient counting
-        let count_result = if let Some(prefix) = &params.key_prefix {
-            // Build COUNT(*) query with prefix range
-            let query_text = format!(
-                "SELECT COUNT(*) FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key >= ? AND key < ?",
-                self.table_name
-            );
-            let prefix_start = prefix.to_string();
-            let prefix_end = format!("{}\u{ff}", prefix); // Compute prefix end inline
-
-            let mut stmt = scylla::statement::Statement::new(query_text);
-            stmt.set_request_timeout(Some(std::time::Duration::from_secs(10)));
-
+        let (stmt, prefix_start, prefix_end) = build_count_query(params.key_prefix.as_deref(), &self.table_name);
+        let count_result = if params.key_prefix.is_some() {
             self.scylla_session
                 .query_unpaged(
                     stmt,
@@ -671,15 +651,6 @@ impl ScyllaDb {
                 )
                 .await
         } else {
-            // Build COUNT(*) query without prefix
-            let query_text = format!(
-                "SELECT COUNT(*) FROM {} WHERE predecessor_id = ? AND current_account_id = ?",
-                self.table_name
-            );
-
-            let mut stmt = scylla::statement::Statement::new(query_text);
-            stmt.set_request_timeout(Some(std::time::Duration::from_secs(10)));
-
             self.scylla_session
                 .query_unpaged(
                     stmt,
@@ -746,7 +717,7 @@ impl ScyllaDb {
             match row_result {
                 Ok(_) => {
                     count += 1;
-                    if count >= 1_000_000 {
+                    if count >= MAX_COUNT_SCAN {
                         estimated = true;
                         break;
                     }

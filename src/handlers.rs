@@ -3,11 +3,68 @@ use crate::models::*;
 use crate::tree::build_tree;
 use crate::AppState;
 
-const PROJECT_ID: &str = "fastkv-server";
-const MAX_OFFSET: usize = 100_000;
-const MAX_PREFIX_LENGTH: usize = 1000;
-const MAX_ACCOUNT_ID_LENGTH: usize = 256;
-const MAX_KEY_LENGTH: usize = 10000;
+use std::collections::HashSet;
+
+fn respond_with_entries(entries: Vec<KvEntry>, fields: &Option<HashSet<String>>) -> HttpResponse {
+    if fields.is_some() {
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .map(|e| e.to_json_with_fields(fields))
+            .collect();
+        HttpResponse::Ok().json(serde_json::json!({ "entries": filtered }))
+    } else {
+        HttpResponse::Ok().json(QueryResponse { entries })
+    }
+}
+
+fn validate_account_id(value: &str, name: &str) -> Result<(), ApiError> {
+    if value.is_empty() {
+        return Err(ApiError::InvalidParameter(format!("{} cannot be empty", name)));
+    }
+    if value.len() > MAX_ACCOUNT_ID_LENGTH {
+        return Err(ApiError::InvalidParameter(
+            format!("{} cannot exceed {} characters", name, MAX_ACCOUNT_ID_LENGTH),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_key(value: &str, name: &str, max_len: usize) -> Result<(), ApiError> {
+    if value.is_empty() {
+        return Err(ApiError::InvalidParameter(format!("{} cannot be empty", name)));
+    }
+    if value.len() > max_len {
+        return Err(ApiError::InvalidParameter(
+            format!("{} cannot exceed {} characters", name, max_len),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_offset(offset: usize) -> Result<(), ApiError> {
+    if offset > MAX_OFFSET {
+        return Err(ApiError::InvalidParameter(
+            format!("offset cannot exceed {}", MAX_OFFSET),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prefix(prefix: &Option<String>) -> Result<(), ApiError> {
+    if let Some(ref p) = prefix {
+        if p.is_empty() {
+            return Err(ApiError::InvalidParameter(
+                "key_prefix cannot be empty string (omit parameter if not filtering)".to_string(),
+            ));
+        }
+        if p.len() > MAX_PREFIX_LENGTH {
+            return Err(ApiError::InvalidParameter(
+                format!("key_prefix cannot exceed {} characters", MAX_PREFIX_LENGTH),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Health check endpoint
 #[utoipa::path(
@@ -26,9 +83,12 @@ pub async fn health_check(app_state: web::Data<AppState>) -> Result<HttpResponse
         Ok(_) => Ok(HttpResponse::Ok().json(HealthResponse {
             status: "ok".to_string(),
         })),
-        Err(_) => Ok(HttpResponse::ServiceUnavailable().json(HealthResponse {
-            status: "database_unavailable".to_string(),
-        })),
+        Err(e) => {
+            tracing::warn!(target: PROJECT_ID, error = %e, "Health check failed");
+            Ok(HttpResponse::ServiceUnavailable().json(HealthResponse {
+                status: "database_unavailable".to_string(),
+            }))
+        }
     }
 }
 
@@ -48,37 +108,9 @@ pub async fn get_kv_handler(
     query: web::Query<GetParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    // Validate required parameters
-    if query.predecessor_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "predecessor_id cannot be empty".to_string(),
-        ));
-    }
-    if query.predecessor_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("predecessor_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
+    validate_account_id(&query.predecessor_id, "predecessor_id")?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -94,7 +126,7 @@ pub async fn get_kv_handler(
         .await?;
 
     // Apply field selection and return
-    let fields = query.parse_fields();
+    let fields = parse_field_set(&query.fields);
     match entry {
         Some(entry) => Ok(HttpResponse::Ok().json(entry.to_json_with_fields(&fields))),
         None => Ok(HttpResponse::Ok().json(serde_json::Value::Null)),
@@ -117,57 +149,12 @@ pub async fn query_kv_handler(
     query: web::Query<QueryParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    // Validate required parameters
-    if query.predecessor_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "predecessor_id cannot be empty".to_string(),
-        ));
-    }
-    if query.predecessor_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("predecessor_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
+    validate_account_id(&query.predecessor_id, "predecessor_id")?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
+    validate_prefix(&query.key_prefix)?;
 
-    // Validate limit
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-
-    // Validate offset
-    if query.offset > MAX_OFFSET {
-        return Err(ApiError::InvalidParameter(
-            format!("offset cannot exceed {}", MAX_OFFSET),
-        ));
-    }
-
-    // Validate key_prefix is not empty if provided
-    if let Some(ref prefix) = query.key_prefix {
-        if prefix.is_empty() {
-            return Err(ApiError::InvalidParameter(
-                "key_prefix cannot be empty string (omit parameter if not filtering)".to_string(),
-            ));
-        }
-        if prefix.len() > MAX_PREFIX_LENGTH {
-            return Err(ApiError::InvalidParameter(
-                format!("key_prefix cannot exceed {} characters", MAX_PREFIX_LENGTH),
-            ));
-        }
-    }
-
-    // Validate format parameter
     if let Some(ref fmt) = query.format {
         if fmt != "tree" {
             return Err(ApiError::InvalidParameter(
@@ -201,17 +188,8 @@ pub async fn query_kv_handler(
         return Ok(HttpResponse::Ok().json(TreeResponse { tree }));
     }
 
-    // Apply field selection
-    let fields = query.parse_fields();
-    if fields.is_some() {
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .map(|e| e.to_json_with_fields(&fields))
-            .collect();
-        Ok(HttpResponse::Ok().json(serde_json::json!({ "entries": filtered })))
-    } else {
-        Ok(HttpResponse::Ok().json(QueryResponse { entries }))
-    }
+    let fields = parse_field_set(&query.fields);
+    Ok(respond_with_entries(entries, &fields))
 }
 
 /// Get historical versions of a KV entry
@@ -230,46 +208,11 @@ pub async fn history_kv_handler(
     query: web::Query<HistoryParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    // Validate required parameters
-    if query.predecessor_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "predecessor_id cannot be empty".to_string(),
-        ));
-    }
-    if query.predecessor_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("predecessor_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
+    validate_account_id(&query.predecessor_id, "predecessor_id")?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
+    validate_limit(query.limit)?;
 
-    // Validate limit
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-
-    // Validate order parameter
     let order_lower = query.order.to_lowercase();
     if order_lower != "asc" && order_lower != "desc" {
         return Err(ApiError::InvalidParameter(
@@ -277,7 +220,6 @@ pub async fn history_kv_handler(
         ));
     }
 
-    // Validate block range if provided
     if let (Some(from), Some(to)) = (query.from_block, query.to_block) {
         if from > to {
             return Err(ApiError::InvalidParameter(
@@ -303,17 +245,8 @@ pub async fn history_kv_handler(
         .get_kv_history(&query)
         .await?;
 
-    // Apply field selection
-    let fields = query.parse_fields();
-    if fields.is_some() {
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .map(|e| e.to_json_with_fields(&fields))
-            .collect();
-        Ok(HttpResponse::Ok().json(serde_json::json!({ "entries": filtered })))
-    } else {
-        Ok(HttpResponse::Ok().json(QueryResponse { entries }))
-    }
+    let fields = parse_field_set(&query.fields);
+    Ok(respond_with_entries(entries, &fields))
 }
 
 /// Count KV entries for a given predecessor and account
@@ -332,41 +265,9 @@ pub async fn count_kv_handler(
     query: web::Query<CountParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    // Validate required parameters
-    if query.predecessor_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "predecessor_id cannot be empty".to_string(),
-        ));
-    }
-    if query.predecessor_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("predecessor_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-
-    // Validate key_prefix is not empty if provided
-    if let Some(ref prefix) = query.key_prefix {
-        if prefix.is_empty() {
-            return Err(ApiError::InvalidParameter(
-                "key_prefix cannot be empty string (omit parameter if not filtering)".to_string(),
-            ));
-        }
-        if prefix.len() > MAX_PREFIX_LENGTH {
-            return Err(ApiError::InvalidParameter(
-                format!("key_prefix cannot exceed {} characters", MAX_PREFIX_LENGTH),
-            ));
-        }
-    }
+    validate_account_id(&query.predecessor_id, "predecessor_id")?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_prefix(&query.key_prefix)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -403,41 +304,10 @@ pub async fn reverse_kv_handler(
     query: web::Query<ReverseParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    // Validate required parameters
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
-
-    // Validate limit
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-
-    // Validate offset
-    if query.offset > MAX_OFFSET {
-        return Err(ApiError::InvalidParameter(
-            format!("offset cannot exceed {}", MAX_OFFSET),
-        ));
-    }
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -453,17 +323,8 @@ pub async fn reverse_kv_handler(
         .reverse_kv_with_dedup(&query)
         .await?;
 
-    // Apply field selection
-    let fields = query.parse_fields();
-    if fields.is_some() {
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .map(|e| e.to_json_with_fields(&fields))
-            .collect();
-        Ok(HttpResponse::Ok().json(serde_json::json!({ "entries": filtered })))
-    } else {
-        Ok(HttpResponse::Ok().json(QueryResponse { entries }))
-    }
+    let fields = parse_field_set(&query.fields);
+    Ok(respond_with_entries(entries, &fields))
 }
 
 /// List keys without values for a given predecessor and account
@@ -482,48 +343,11 @@ pub async fn keys_handler(
     query: web::Query<KeysParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.predecessor_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "predecessor_id cannot be empty".to_string(),
-        ));
-    }
-    if query.predecessor_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("predecessor_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-    if query.offset > MAX_OFFSET {
-        return Err(ApiError::InvalidParameter(
-            format!("offset cannot exceed {}", MAX_OFFSET),
-        ));
-    }
-    if let Some(ref prefix) = query.key_prefix {
-        if prefix.is_empty() {
-            return Err(ApiError::InvalidParameter(
-                "key_prefix cannot be empty string (omit parameter if not filtering)".to_string(),
-            ));
-        }
-        if prefix.len() > MAX_PREFIX_LENGTH {
-            return Err(ApiError::InvalidParameter(
-                format!("key_prefix cannot exceed {} characters", MAX_PREFIX_LENGTH),
-            ));
-        }
-    }
+    validate_account_id(&query.predecessor_id, "predecessor_id")?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
+    validate_prefix(&query.key_prefix)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -559,36 +383,10 @@ pub async fn accounts_handler(
     query: web::Query<AccountsParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-    if query.offset > MAX_OFFSET {
-        return Err(ApiError::InvalidParameter(
-            format!("offset cannot exceed {}", MAX_OFFSET),
-        ));
-    }
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -624,26 +422,8 @@ pub async fn accounts_count_handler(
     query: web::Query<AccountsCountParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -659,7 +439,7 @@ pub async fn accounts_count_handler(
 
     Ok(HttpResponse::Ok().json(CountResponse {
         count,
-        estimated: count >= 1_000_000,
+        estimated: count >= MAX_COUNT_SCAN,
     }))
 }
 
@@ -679,36 +459,10 @@ pub async fn by_key_handler(
     query: web::Query<ByKeyParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.key.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
-        ));
-    }
-    if query.key.len() > MAX_KEY_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("key cannot exceed {} characters", MAX_KEY_LENGTH),
-        ));
-    }
-    if query.current_account_id.is_empty() {
-        return Err(ApiError::InvalidParameter(
-            "current_account_id cannot be empty".to_string(),
-        ));
-    }
-    if query.current_account_id.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            format!("current_account_id cannot exceed {} characters", MAX_ACCOUNT_ID_LENGTH),
-        ));
-    }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
-        ));
-    }
-    if query.offset > MAX_OFFSET {
-        return Err(ApiError::InvalidParameter(
-            format!("offset cannot exceed {}", MAX_OFFSET),
-        ));
-    }
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
+    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -724,20 +478,9 @@ pub async fn by_key_handler(
         .query_by_key(&query)
         .await?;
 
-    let fields = query.parse_fields();
-    if fields.is_some() {
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .map(|e| e.to_json_with_fields(&fields))
-            .collect();
-        Ok(HttpResponse::Ok().json(serde_json::json!({ "entries": filtered })))
-    } else {
-        Ok(HttpResponse::Ok().json(QueryResponse { entries }))
-    }
+    let fields = parse_field_set(&query.fields);
+    Ok(respond_with_entries(entries, &fields))
 }
-
-const MAX_BATCH_KEYS: usize = 100;
-const MAX_BATCH_KEY_LENGTH: usize = 1024;
 
 /// Batch lookup: get values for multiple keys in a single request
 #[utoipa::path(
@@ -755,16 +498,8 @@ pub async fn batch_kv_handler(
     body: web::Json<BatchQuery>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if body.predecessor.is_empty() || body.predecessor.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            "predecessor must be a valid NEAR account ID".to_string(),
-        ));
-    }
-    if body.current_account.is_empty() || body.current_account.len() > MAX_ACCOUNT_ID_LENGTH {
-        return Err(ApiError::InvalidParameter(
-            "current_account must be a valid NEAR account ID".to_string(),
-        ));
-    }
+    validate_account_id(&body.predecessor_id, "predecessor_id")?;
+    validate_account_id(&body.current_account_id, "current_account_id")?;
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter(
             "keys cannot be empty".to_string(),
@@ -785,37 +520,126 @@ pub async fn batch_kv_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor = %body.predecessor,
-        current_account = %body.current_account,
+        predecessor_id = %body.predecessor_id,
+        current_account_id = %body.current_account_id,
         key_count = body.keys.len(),
         "POST /v1/kv/batch"
     );
 
-    let futures: Vec<_> = body
-        .keys
-        .iter()
-        .map(|key| {
-            app_state
-                .scylladb
-                .get_kv_last(&body.predecessor, &body.current_account, key)
-        })
-        .collect();
-
-    let results = futures::future::join_all(futures).await;
-
-    let items: Vec<BatchResultItem> = body
-        .keys
-        .iter()
-        .zip(results)
-        .map(|(key, result)| {
-            let value = result.ok().flatten();
-            BatchResultItem {
-                key: key.clone(),
-                found: value.is_some(),
-                value,
+    use futures::stream::{self, StreamExt};
+    let items: Vec<BatchResultItem> = stream::iter(body.keys.iter().map(|key| {
+        let scylladb = app_state.scylladb.clone();
+        let predecessor_id = body.predecessor_id.clone();
+        let current_account_id = body.current_account_id.clone();
+        let key = key.clone();
+        async move {
+            match scylladb.get_kv_last(&predecessor_id, &current_account_id, &key).await {
+                Ok(value) => BatchResultItem {
+                    key,
+                    found: value.is_some(),
+                    value,
+                    error: None,
+                },
+                Err(e) => BatchResultItem {
+                    key,
+                    found: false,
+                    value: None,
+                    error: Some(e.to_string()),
+                },
             }
-        })
-        .collect();
+        }
+    }))
+    .buffered(10)
+    .collect()
+    .await;
 
     Ok(HttpResponse::Ok().json(BatchResponse { results: items }))
+}
+
+/// Commit KV data to NEAR blockchain
+#[utoipa::path(
+    post,
+    path = "/v1/kv/commit",
+    request_body = CommitRequest,
+    responses(
+        (status = 200, description = "Successfully committed to NEAR", body = CommitResponse),
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 502, description = "NEAR transaction failed", body = ApiError),
+        (status = 504, description = "Transaction timed out — check chain before retrying", body = ApiError)
+    ),
+    tag = "kv"
+)]
+#[post("/v1/kv/commit")]
+pub async fn commit_kv_handler(
+    body: web::Json<CommitRequest>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    let near_client = app_state.near_client.as_ref().ok_or_else(|| {
+        ApiError::TransactionError("NEAR client not configured".to_string())
+    })?;
+
+    if body.keys.is_empty() {
+        return Err(ApiError::InvalidParameter("keys cannot be empty".to_string()));
+    }
+    if body.keys.len() > MAX_COMMIT_KEYS {
+        return Err(ApiError::InvalidParameter(
+            format!("keys cannot exceed {} items", MAX_COMMIT_KEYS),
+        ));
+    }
+
+    for ck in &body.keys {
+        validate_account_id(&ck.predecessor_id, "predecessor_id")?;
+        validate_account_id(&ck.current_account_id, "current_account_id")?;
+        validate_key(&ck.key, "key", MAX_KEY_LENGTH)?;
+    }
+
+    tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), "POST /v1/kv/commit");
+
+    let fetch_futures: Vec<_> = body.keys.iter().map(|ck| {
+        let scylladb = app_state.scylladb.clone();
+        let predecessor_id = ck.predecessor_id.clone();
+        let current_account_id = ck.current_account_id.clone();
+        let key = ck.key.clone();
+        async move {
+            let value = scylladb
+                .get_kv_last(&predecessor_id, &current_account_id, &key)
+                .await
+                .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch key '{}': {}", key, e)))?;
+            match value {
+                Some(v) => Ok((key, v)),
+                None => Err(ApiError::InvalidParameter(format!("key '{}' not found", key))),
+            }
+        }
+    }).collect();
+
+    let results = futures::future::join_all(fetch_futures).await;
+    let mut kv_pairs = Vec::with_capacity(results.len());
+    for result in results {
+        kv_pairs.push(result?);
+    }
+
+    let num_keys = kv_pairs.len();
+    let near_timeout = std::time::Duration::from_secs(30);
+    let tx_result = actix_web::rt::time::timeout(near_timeout, near_client.commit_batch(kv_pairs)).await;
+
+    let tx_hash = match tx_result {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(e)) => {
+            tracing::error!(target: PROJECT_ID, error = %e, "NEAR transaction failed");
+            return Err(ApiError::TransactionError(e.to_string()));
+        }
+        Err(_) => {
+            tracing::error!(target: PROJECT_ID, "NEAR transaction timed out — tx may still land on-chain");
+            return Err(ApiError::TransactionTimeout(
+                "Transaction timed out after 30s — check chain before retrying".to_string(),
+            ));
+        }
+    };
+
+    tracing::info!(target: PROJECT_ID, tx_hash = %tx_hash, keys = num_keys, "Committed to NEAR");
+
+    Ok(HttpResponse::Ok().json(CommitResponse {
+        transaction_hash: tx_hash,
+        keys_committed: num_keys,
+    }))
 }

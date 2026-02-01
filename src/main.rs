@@ -1,11 +1,13 @@
 mod handlers;
 mod models;
+mod near_client;
 mod queries;
 mod scylladb;
 mod social_handlers;
 mod tree;
 
-use crate::handlers::{accounts_count_handler, accounts_handler, batch_kv_handler, by_key_handler, count_kv_handler, get_kv_handler, health_check, history_kv_handler, keys_handler, query_kv_handler, reverse_kv_handler};
+use crate::handlers::{accounts_count_handler, accounts_handler, batch_kv_handler, by_key_handler, commit_kv_handler, count_kv_handler, get_kv_handler, health_check, history_kv_handler, keys_handler, query_kv_handler, reverse_kv_handler};
+use crate::near_client::NearClient;
 use crate::social_handlers::{
     social_get_handler, social_keys_handler, social_index_handler,
     social_profile_handler, social_followers_handler, social_following_handler,
@@ -24,7 +26,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
-const PROJECT_ID: &str = "fastkv-server";
+use crate::models::PROJECT_ID;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -40,6 +42,7 @@ const PROJECT_ID: &str = "fastkv-server";
         handlers::keys_handler,
         handlers::accounts_handler,
         handlers::accounts_count_handler,
+        handlers::commit_kv_handler,
         social_handlers::social_get_handler,
         social_handlers::social_keys_handler,
         social_handlers::social_index_handler,
@@ -91,11 +94,14 @@ const PROJECT_ID: &str = "fastkv-server";
         models::IndexResponse,
         models::SocialFollowResponse,
         models::SocialFeedResponse,
+        models::CommitRequest,
+        models::CommitKey,
+        models::CommitResponse,
     )),
     info(
         title = "FastKV API",
         version = "1.0.0",
-        description = "Query FastData KV entries from ScyllaDB. This API provides access to NEAR Protocol contract storage data."
+        description = "Query FastData KV entries from ScyllaDB. This API provides access to NEAR Protocol data storage."
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
@@ -108,6 +114,7 @@ struct ApiDoc;
 #[derive(Clone)]
 pub struct AppState {
     pub scylladb: Arc<ScyllaDb>,
+    pub near_client: Option<Arc<NearClient>>,
 }
 
 #[actix_web::main]
@@ -142,6 +149,15 @@ async fn main() -> std::io::Result<()> {
             .expect("Can't create scylla db"),
     );
 
+    let near_client = match NearClient::from_env() {
+        Ok(Some(client)) => Some(Arc::new(client)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(target: PROJECT_ID, error = %e, "Failed to initialize NEAR client");
+            return Err(std::io::Error::other(e.to_string()));
+        }
+    };
+
     HttpServer::new(move || {
         // Configure CORS middleware
         let cors = Cors::default()
@@ -157,6 +173,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(AppState {
                 scylladb: Arc::clone(&scylladb),
+                near_client: near_client.clone(),
             }))
             .wrap(cors)
             .wrap(middleware::Compress::default())
@@ -176,6 +193,7 @@ async fn main() -> std::io::Result<()> {
             .service(keys_handler)
             .service(accounts_handler)
             .service(accounts_count_handler)
+            .service(commit_kv_handler)
             .service(social_get_handler)
             .service(social_keys_handler)
             .service(social_index_handler)

@@ -3,6 +3,22 @@ use scylla::DeserializeRow;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// Shared validation constants
+pub const MAX_OFFSET: usize = 100_000;
+pub const MAX_PREFIX_LENGTH: usize = 1000;
+pub const MAX_ACCOUNT_ID_LENGTH: usize = 256;
+pub const MAX_KEY_LENGTH: usize = 10000;
+pub const MAX_BATCH_KEYS: usize = 100;
+pub const MAX_BATCH_KEY_LENGTH: usize = 1024;
+pub const MAX_COMMIT_KEYS: usize = 50;
+pub const MAX_COUNT_SCAN: usize = 1_000_000;
+pub const MAX_SOCIAL_RESULTS: usize = 1000;
+pub const MAX_SOCIAL_KEYS: usize = 100;
+pub const MAX_STREAM_ERRORS: usize = 10;
+pub const MAX_HISTORY_SCAN: usize = 10_000;
+pub const MAX_DEDUP_SCAN: usize = 100_000;
+pub const PROJECT_ID: &str = "fastkv-server";
+
 // Raw row from ScyllaDB s_kv_last (matches table schema exactly)
 #[derive(DeserializeRow, Debug, Clone)]
 pub struct KvRow {
@@ -60,10 +76,10 @@ pub struct KvEntry {
 }
 
 impl KvEntry {
-    // Convert to JSON with only requested fields
-    pub fn to_json_with_fields(&self, fields: &Option<Vec<String>>) -> serde_json::Value {
-        if let Some(field_list) = fields {
-            let field_set: std::collections::HashSet<_> = field_list.iter().map(|s| s.as_str()).collect();
+    /// Convert to JSON with only requested fields. Pass a pre-built HashSet to avoid
+    /// rebuilding it per entry when called in a loop.
+    pub fn to_json_with_fields(&self, fields: &Option<std::collections::HashSet<String>>) -> serde_json::Value {
+        if let Some(field_set) = fields {
             let mut map = serde_json::Map::new();
 
             if field_set.contains("predecessor_id") {
@@ -102,6 +118,13 @@ impl KvEntry {
     }
 }
 
+/// Convert a ScyllaDB bigint (i64) to u64, clamping negatives to 0.
+/// ScyllaDB stores block heights/timestamps as bigint (i64) but they are
+/// logically unsigned. Negative values indicate upstream data issues.
+pub fn bigint_to_u64(val: i64) -> u64 {
+    val.max(0) as u64
+}
+
 impl From<KvRow> for KvEntry {
     fn from(row: KvRow) -> Self {
         Self {
@@ -109,8 +132,8 @@ impl From<KvRow> for KvEntry {
             current_account_id: row.current_account_id,
             key: row.key,
             value: row.value,
-            block_height: row.block_height.max(0) as u64,
-            block_timestamp: row.block_timestamp.max(0) as u64,
+            block_height: bigint_to_u64(row.block_height),
+            block_timestamp: bigint_to_u64(row.block_timestamp),
             receipt_id: row.receipt_id,
             tx_hash: row.tx_hash,
         }
@@ -124,8 +147,8 @@ impl From<KvHistoryRow> for KvEntry {
             current_account_id: row.current_account_id,
             key: row.key,
             value: row.value,
-            block_height: row.block_height.max(0) as u64,
-            block_timestamp: row.block_timestamp.max(0) as u64,
+            block_height: bigint_to_u64(row.block_height),
+            block_timestamp: bigint_to_u64(row.block_timestamp),
             receipt_id: row.receipt_id,
             tx_hash: row.tx_hash,
         }
@@ -158,15 +181,21 @@ pub struct GetParams {
     pub fields: Option<String>, // Comma-separated field names
 }
 
-impl GetParams {
-    pub fn parse_fields(&self) -> Option<Vec<String>> {
-        self.fields.as_ref().map(|f| {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
+/// Parse a comma-separated fields string into a set of field names.
+pub fn parse_field_set(fields: &Option<String>) -> Option<std::collections::HashSet<String>> {
+    fields.as_ref().map(|f| {
+        f.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+pub fn validate_limit(limit: usize) -> Result<(), ApiError> {
+    if limit == 0 || limit > 1000 {
+        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
     }
+    Ok(())
 }
 
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
@@ -187,16 +216,6 @@ pub struct QueryParams {
     pub format: Option<String>, // "tree" for nested JSON response
 }
 
-impl QueryParams {
-    pub fn parse_fields(&self) -> Option<Vec<String>> {
-        self.fields.as_ref().map(|f| {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-    }
-}
 
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct ReverseParams {
@@ -212,16 +231,6 @@ pub struct ReverseParams {
     pub fields: Option<String>, // Comma-separated field names
 }
 
-impl ReverseParams {
-    pub fn parse_fields(&self) -> Option<Vec<String>> {
-        self.fields.as_ref().map(|f| {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-    }
-}
 
 fn default_limit() -> usize {
     100
@@ -245,16 +254,6 @@ pub struct HistoryParams {
     pub fields: Option<String>, // Comma-separated field names
 }
 
-impl HistoryParams {
-    pub fn parse_fields(&self) -> Option<Vec<String>> {
-        self.fields.as_ref().map(|f| {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-    }
-}
 
 fn default_history_limit() -> usize {
     100
@@ -321,16 +320,6 @@ pub struct ByKeyParams {
     pub fields: Option<String>,
 }
 
-impl ByKeyParams {
-    pub fn parse_fields(&self) -> Option<Vec<String>> {
-        self.fields.as_ref().map(|f| {
-            f.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-    }
-}
 
 // Count query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
@@ -351,8 +340,10 @@ pub struct CountResponse {
 // Batch query structs
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct BatchQuery {
-    pub predecessor: String,
-    pub current_account: String,
+    #[serde(alias = "predecessor")]
+    pub predecessor_id: String,
+    #[serde(alias = "current_account")]
+    pub current_account_id: String,
     pub keys: Vec<String>,
 }
 
@@ -361,6 +352,8 @@ pub struct BatchResultItem {
     pub key: String,
     pub value: Option<String>,
     pub found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -525,6 +518,8 @@ pub struct SocialFeedResponse {
 pub enum ApiError {
     InvalidParameter(String),
     DatabaseError(String),
+    TransactionError(String),
+    TransactionTimeout(String),
 }
 
 impl fmt::Display for ApiError {
@@ -532,6 +527,8 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::InvalidParameter(msg) => write!(f, "Invalid parameter: {}", msg),
             ApiError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
+            ApiError::TransactionError(msg) => write!(f, "Transaction error: {}", msg),
+            ApiError::TransactionTimeout(msg) => write!(f, "Transaction timeout: {}", msg),
         }
     }
 }
@@ -541,6 +538,8 @@ impl ResponseError for ApiError {
         let status = match self {
             ApiError::InvalidParameter(_) => StatusCode::BAD_REQUEST,
             ApiError::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::TransactionError(_) => StatusCode::BAD_GATEWAY,
+            ApiError::TransactionTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         };
 
         HttpResponse::build(status).json(serde_json::json!({
@@ -556,8 +555,27 @@ impl From<anyhow::Error> for ApiError {
             error = %err,
             "Database error occurred"
         );
-        ApiError::DatabaseError("Database error occurred".to_string())
+        ApiError::DatabaseError(err.to_string())
     }
+}
+
+// Commit endpoint types
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct CommitRequest {
+    pub keys: Vec<CommitKey>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct CommitKey {
+    pub predecessor_id: String,
+    pub current_account_id: String,
+    pub key: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CommitResponse {
+    pub transaction_hash: String,
+    pub keys_committed: usize,
 }
 
 #[cfg(test)]
@@ -590,5 +608,13 @@ mod tests {
     #[test]
     fn test_default_limit() {
         assert_eq!(default_limit(), 100);
+    }
+
+    #[test]
+    fn test_bigint_to_u64_negative() {
+        assert_eq!(bigint_to_u64(-1), 0);
+        assert_eq!(bigint_to_u64(i64::MIN), 0);
+        assert_eq!(bigint_to_u64(0), 0);
+        assert_eq!(bigint_to_u64(42), 42);
     }
 }

@@ -5,10 +5,12 @@ use crate::models::*;
 use crate::tree::build_tree;
 use crate::AppState;
 
-const PROJECT_ID: &str = "fastkv-server";
-const SOCIAL_CONTRACT: &str = "social.near";
-const MAX_KEYS: usize = 100;
-const MAX_ACCOUNT_ID_LENGTH: usize = 256;
+use std::sync::LazyLock;
+
+
+static SOCIAL_CONTRACT: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("SOCIAL_CONTRACT").unwrap_or_else(|_| "social.near".to_string())
+});
 
 // ===== Key pattern parsing =====
 
@@ -105,7 +107,7 @@ async fn query_index(
         .scylla_session
         .execute_iter(
             app_state.scylladb.reverse_kv.clone(),
-            (SOCIAL_CONTRACT, &index_key),
+            (SOCIAL_CONTRACT.as_str(), &index_key),
         )
         .await
         .map_err(anyhow::Error::from)?
@@ -113,38 +115,60 @@ async fn query_index(
         .map_err(anyhow::Error::from)?;
 
     let mut entries: Vec<IndexEntry> = Vec::new();
+    let mut error_count = 0usize;
 
-    while let Some(row_result) = rows_stream.next().await {
-        let row = match row_result {
-            Ok(row) => row,
-            Err(e) => {
-                tracing::warn!(target: PROJECT_ID, error = %e, "Failed to deserialize row in query_index");
-                continue;
+    let stream_result = actix_web::rt::time::timeout(
+        std::time::Duration::from_secs(30),
+        async {
+            while let Some(row_result) = rows_stream.next().await {
+                let row = match row_result {
+                    Ok(row) => row,
+                    Err(e) => {
+                        error_count += 1;
+                        tracing::warn!(target: PROJECT_ID, error = %e, "Failed to deserialize row in query_index");
+                        if error_count >= MAX_STREAM_ERRORS {
+                            return Err(ApiError::DatabaseError(
+                                format!("Too many deserialization errors ({}) in query_index", error_count),
+                            ));
+                        }
+                        continue;
+                    }
+                };
+
+                let block_height = bigint_to_u64(row.block_height);
+
+                // Apply cursor filter
+                if let Some(from_block) = from {
+                    if order == "desc" && block_height >= from_block {
+                        continue;
+                    }
+                    if order == "asc" && block_height <= from_block {
+                        continue;
+                    }
+                }
+
+                let value = serde_json::from_str(&row.value).ok();
+
+                entries.push(IndexEntry {
+                    account_id: row.predecessor_id,
+                    block_height,
+                    value,
+                });
+
+                if entries.len() >= limit {
+                    break;
+                }
             }
-        };
+            Ok(())
+        },
+    )
+    .await;
 
-        let block_height = row.block_height.max(0) as u64;
-
-        // Apply cursor filter
-        if let Some(from_block) = from {
-            if order == "desc" && block_height >= from_block {
-                continue;
-            }
-            if order == "asc" && block_height <= from_block {
-                continue;
-            }
-        }
-
-        let value = serde_json::from_str(&row.value).ok();
-
-        entries.push(IndexEntry {
-            account_id: row.predecessor_id,
-            block_height,
-            value,
-        });
-
-        if entries.len() >= limit {
-            break;
+    match stream_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            tracing::warn!(target: PROJECT_ID, "query_index stream timed out after 30s, returning partial results");
         }
     }
 
@@ -180,9 +204,9 @@ pub async fn social_get_handler(
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter("keys cannot be empty".to_string()));
     }
-    if body.keys.len() > MAX_KEYS {
+    if body.keys.len() > MAX_SOCIAL_KEYS {
         return Err(ApiError::InvalidParameter(
-            format!("keys cannot exceed {} patterns", MAX_KEYS),
+            format!("keys cannot exceed {} patterns", MAX_SOCIAL_KEYS),
         ));
     }
 
@@ -196,6 +220,7 @@ pub async fn social_get_handler(
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), "POST /v1/social/get");
 
     let mut result_root = serde_json::Map::new();
+    let mut truncated = false;
 
     for pattern in &body.keys {
         let parsed = parse_social_key(pattern)?;
@@ -203,7 +228,7 @@ pub async fn social_get_handler(
         match parsed {
             KeyPattern::Exact { account_id, key } => {
                 let entry = app_state.scylladb
-                    .get_kv(&account_id, SOCIAL_CONTRACT, &key)
+                    .get_kv(&account_id, &SOCIAL_CONTRACT, &key)
                     .await?;
 
                 if let Some(entry) = entry {
@@ -232,16 +257,19 @@ pub async fn social_get_handler(
             KeyPattern::RecursiveWildcard { account_id, key_prefix } => {
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.to_string(),
+                    current_account_id: SOCIAL_CONTRACT.clone(),
                     key_prefix: if key_prefix.is_empty() { None } else { Some(key_prefix) },
                     exclude_null: if return_deleted { Some(false) } else { Some(true) },
-                    limit: 1000,
+                    limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                     format: None,
                 };
 
                 let entries = app_state.scylladb.query_kv_with_pagination(&query).await?;
+                if entries.len() >= MAX_SOCIAL_RESULTS {
+                    truncated = true;
+                }
 
                 let items: Vec<(String, String)> = entries.iter()
                     .map(|e| (e.key.clone(), e.value.clone()))
@@ -263,16 +291,19 @@ pub async fn social_get_handler(
             KeyPattern::SingleWildcard { account_id, key_prefix } => {
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.to_string(),
+                    current_account_id: SOCIAL_CONTRACT.clone(),
                     key_prefix: Some(key_prefix.clone()),
                     exclude_null: if return_deleted { Some(false) } else { Some(true) },
-                    limit: 1000,
+                    limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                     format: None,
                 };
 
                 let entries = app_state.scylladb.query_kv_with_pagination(&query).await?;
+                if entries.len() >= MAX_SOCIAL_RESULTS {
+                    truncated = true;
+                }
 
                 // Filter to single level only: key should be prefix + "something" with no more slashes
                 let prefix_depth = key_prefix.matches('/').count();
@@ -296,12 +327,15 @@ pub async fn social_get_handler(
                 // Use by-key view to find all predecessors with this exact key
                 let by_key_params = ByKeyParams {
                     key: key.clone(),
-                    current_account_id: SOCIAL_CONTRACT.to_string(),
-                    limit: 1000,
+                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                 };
                 let entries = app_state.scylladb.query_by_key(&by_key_params).await?;
+                if entries.len() >= MAX_SOCIAL_RESULTS {
+                    truncated = true;
+                }
 
                 for entry in &entries {
                     let items = vec![(entry.key.clone(), entry.value.clone())];
@@ -317,6 +351,9 @@ pub async fn social_get_handler(
         }
     }
 
+    if truncated {
+        result_root.insert("warning".to_string(), serde_json::json!("results_truncated"));
+    }
     Ok(HttpResponse::Ok().json(serde_json::Value::Object(result_root)))
 }
 
@@ -339,9 +376,9 @@ pub async fn social_keys_handler(
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter("keys cannot be empty".to_string()));
     }
-    if body.keys.len() > MAX_KEYS {
+    if body.keys.len() > MAX_SOCIAL_KEYS {
         return Err(ApiError::InvalidParameter(
-            format!("keys cannot exceed {} patterns", MAX_KEYS),
+            format!("keys cannot exceed {} patterns", MAX_SOCIAL_KEYS),
         ));
     }
 
@@ -359,6 +396,7 @@ pub async fn social_keys_handler(
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), "POST /v1/social/keys");
 
     let mut result_root = serde_json::Map::new();
+    let mut truncated = false;
 
     for pattern in &body.keys {
         let parsed = parse_social_key(pattern)?;
@@ -366,7 +404,7 @@ pub async fn social_keys_handler(
         match parsed {
             KeyPattern::Exact { account_id, key } => {
                 let entry = app_state.scylladb
-                    .get_kv(&account_id, SOCIAL_CONTRACT, &key)
+                    .get_kv(&account_id, &SOCIAL_CONTRACT, &key)
                     .await?;
 
                 if let Some(entry) = entry {
@@ -394,16 +432,19 @@ pub async fn social_keys_handler(
                 // unless return_deleted is explicitly false AND values_only is set
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.to_string(),
+                    current_account_id: SOCIAL_CONTRACT.clone(),
                     key_prefix: if key_prefix.is_empty() { None } else { Some(key_prefix.clone()) },
                     exclude_null: Some(false),
-                    limit: 1000,
+                    limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                     format: None,
                 };
 
                 let entries = app_state.scylladb.query_kv_with_pagination(&query).await?;
+                if entries.len() >= MAX_SOCIAL_RESULTS {
+                    truncated = true;
+                }
 
                 tracing::debug!(
                     target: PROJECT_ID,
@@ -417,7 +458,7 @@ pub async fn social_keys_handler(
 
                 // For SingleWildcard, filter to single level
                 let prefix_depth = key_prefix.matches('/').count();
-                let is_single = matches!(parse_social_key(pattern)?, KeyPattern::SingleWildcard { .. });
+                let is_single = pattern.ends_with("/*") && !pattern.ends_with("/**");
 
                 let after_depth: Vec<&KvEntry> = entries.iter()
                     .filter(|e| !is_single || e.key.matches('/').count() == prefix_depth)
@@ -443,7 +484,11 @@ pub async fn social_keys_handler(
                 );
 
                 let filtered: Vec<&KvEntry> = after_deleted.into_iter()
-                    .filter(|e| !values_only || !is_intermediate_key(e, &entries))
+                    .filter(|e| {
+                        if !values_only { return true; }
+                        let prefix = format!("{}/", e.key);
+                        !entries.iter().any(|other| other.key.starts_with(&prefix))
+                    })
                     .copied()
                     .collect();
                 tracing::debug!(
@@ -470,18 +515,21 @@ pub async fn social_keys_handler(
                     .entry(account_id.clone())
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
                 if let serde_json::Value::Object(ref mut obj) = account_obj {
-                    deep_merge_json(obj, &subtree);
+                    merge_json(obj, &subtree);
                 }
             }
             KeyPattern::WildcardAccount { key } => {
                 let by_key_params = ByKeyParams {
                     key: key.clone(),
-                    current_account_id: SOCIAL_CONTRACT.to_string(),
-                    limit: 1000,
+                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                 };
                 let entries = app_state.scylladb.query_by_key(&by_key_params).await?;
+                if entries.len() >= MAX_SOCIAL_RESULTS {
+                    truncated = true;
+                }
 
                 for entry in &entries {
                     if !return_deleted && entry.value == "null" {
@@ -505,6 +553,9 @@ pub async fn social_keys_handler(
         }
     }
 
+    if truncated {
+        result_root.insert("warning".to_string(), serde_json::json!("results_truncated"));
+    }
     Ok(HttpResponse::Ok().json(serde_json::Value::Object(result_root)))
 }
 
@@ -530,9 +581,7 @@ pub async fn social_index_handler(
     if query.key.is_empty() {
         return Err(ApiError::InvalidParameter("key cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, "GET /v1/social/index");
 
@@ -565,10 +614,10 @@ pub async fn social_profile_handler(
 
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.to_string(),
+        current_account_id: SOCIAL_CONTRACT.clone(),
         key_prefix: Some("profile/".to_string()),
         exclude_null: Some(true),
-        limit: 1000,
+        limit: MAX_SOCIAL_RESULTS,
         offset: 0,
         fields: None,
         format: None,
@@ -607,9 +656,7 @@ pub async fn social_followers_handler(
     if query.account_id.is_empty() {
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/followers");
 
@@ -617,7 +664,7 @@ pub async fn social_followers_handler(
     let follow_key = format!("graph/follow/{}", query.account_id);
 
     let params = AccountsParams {
-        current_account_id: SOCIAL_CONTRACT.to_string(),
+        current_account_id: SOCIAL_CONTRACT.clone(),
         key: follow_key,
         exclude_null: Some(true),
         limit: query.limit,
@@ -649,16 +696,14 @@ pub async fn social_following_handler(
     if query.account_id.is_empty() {
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/following");
 
     // Following are keys under "graph/follow/" written by this account to social.near
     let keys_params = KeysParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.to_string(),
+        current_account_id: SOCIAL_CONTRACT.clone(),
         key_prefix: Some("graph/follow/".to_string()),
         limit: query.limit,
         offset: query.offset,
@@ -673,6 +718,21 @@ pub async fn social_following_handler(
     let count = accounts.len();
 
     Ok(HttpResponse::Ok().json(SocialFollowResponse { accounts, count }))
+}
+
+async fn handle_item_query(
+    query: &SocialItemParams,
+    app_state: &AppState,
+    action: &str,
+    endpoint: &str,
+) -> Result<HttpResponse, ApiError> {
+    validate_item_params(query)?;
+    tracing::info!(target: PROJECT_ID, path = %query.path, block_height = query.block_height, endpoint);
+
+    let key = format!("{}\n{}", query.path, query.block_height);
+    let entries = query_index(app_state, action, &key, &query.order, query.limit, None).await?;
+
+    Ok(HttpResponse::Ok().json(IndexResponse { entries }))
 }
 
 /// Get likes for an item
@@ -691,13 +751,7 @@ pub async fn social_likes_handler(
     query: web::Query<SocialItemParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_item_params(&query)?;
-    tracing::info!(target: PROJECT_ID, path = %query.path, block_height = query.block_height, "GET /v1/social/likes");
-
-    let key = format!("{}\n{}", query.path, query.block_height);
-    let entries = query_index(&app_state, "like", &key, &query.order, query.limit, None).await?;
-
-    Ok(HttpResponse::Ok().json(IndexResponse { entries }))
+    handle_item_query(&query, &app_state, "like", "GET /v1/social/likes").await
 }
 
 /// Get comments for an item
@@ -716,13 +770,7 @@ pub async fn social_comments_handler(
     query: web::Query<SocialItemParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_item_params(&query)?;
-    tracing::info!(target: PROJECT_ID, path = %query.path, block_height = query.block_height, "GET /v1/social/comments");
-
-    let key = format!("{}\n{}", query.path, query.block_height);
-    let entries = query_index(&app_state, "comment", &key, &query.order, query.limit, None).await?;
-
-    Ok(HttpResponse::Ok().json(IndexResponse { entries }))
+    handle_item_query(&query, &app_state, "comment", "GET /v1/social/comments").await
 }
 
 /// Get reposts for an item
@@ -741,13 +789,7 @@ pub async fn social_reposts_handler(
     query: web::Query<SocialItemParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_item_params(&query)?;
-    tracing::info!(target: PROJECT_ID, path = %query.path, block_height = query.block_height, "GET /v1/social/reposts");
-
-    let key = format!("{}\n{}", query.path, query.block_height);
-    let entries = query_index(&app_state, "repost", &key, &query.order, query.limit, None).await?;
-
-    Ok(HttpResponse::Ok().json(IndexResponse { entries }))
+    handle_item_query(&query, &app_state, "repost", "GET /v1/social/reposts").await
 }
 
 /// Get posts from a specific account
@@ -769,16 +811,14 @@ pub async fn social_account_feed_handler(
     if query.account_id.is_empty() {
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/feed/account");
 
     // Query history for post/main key to get all posts with their block heights
     let history_params = HistoryParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.to_string(),
+        current_account_id: SOCIAL_CONTRACT.clone(),
         key: "post/main".to_string(),
         limit: query.limit,
         order: query.order.clone(),
@@ -819,9 +859,7 @@ pub async fn social_hashtag_feed_handler(
     if query.hashtag.is_empty() {
         return Err(ApiError::InvalidParameter("hashtag cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, hashtag = %query.hashtag, "GET /v1/social/feed/hashtag");
 
@@ -846,9 +884,7 @@ pub async fn social_activity_feed_handler(
     query: web::Query<SocialActivityFeedParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, "GET /v1/social/feed/activity");
 
@@ -876,9 +912,7 @@ pub async fn social_notifications_handler(
     if query.account_id.is_empty() {
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/notifications");
 
@@ -889,70 +923,55 @@ pub async fn social_notifications_handler(
 
 // ===== Utility functions =====
 
-/// Returns true if this entry's key is a prefix of another entry's key,
-/// meaning it's an intermediate path node rather than a leaf value.
-fn is_intermediate_key(entry: &KvEntry, all_entries: &[KvEntry]) -> bool {
-    let prefix = format!("{}/", entry.key);
-    all_entries.iter().any(|other| other.key.starts_with(&prefix))
-}
-
 fn validate_item_params(query: &SocialItemParams) -> Result<(), ApiError> {
     if query.path.is_empty() {
         return Err(ApiError::InvalidParameter("path cannot be empty".to_string()));
     }
-    if query.limit == 0 || query.limit > 1000 {
-        return Err(ApiError::InvalidParameter("limit must be between 1 and 1000".to_string()));
-    }
+    validate_limit(query.limit)?;
     Ok(())
 }
 
 fn merge_json(target: &mut serde_json::Map<String, serde_json::Value>, source: &serde_json::Value) {
     if let serde_json::Value::Object(source_obj) = source {
-        for (key, value) in source_obj {
-            match (target.get_mut(key), value) {
-                (Some(serde_json::Value::Object(ref mut existing)), serde_json::Value::Object(incoming)) => {
-                    let incoming_value = serde_json::Value::Object(incoming.clone());
-                    merge_json(existing, &incoming_value);
-                }
-                _ => {
-                    target.insert(key.clone(), value.clone());
-                }
+        merge_json_maps(target, source_obj);
+    }
+}
+
+fn merge_json_maps(target: &mut serde_json::Map<String, serde_json::Value>, source: &serde_json::Map<String, serde_json::Value>) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(serde_json::Value::Object(ref mut existing)), serde_json::Value::Object(incoming)) => {
+                merge_json_maps(existing, incoming);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
             }
         }
     }
 }
 
-fn deep_merge_json(target: &mut serde_json::Map<String, serde_json::Value>, source: &serde_json::Value) {
-    merge_json(target, source);
-}
 
 fn insert_block_height(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     block_height: u64,
 ) {
-    // SocialDB convention: add ":block" key alongside the value
     let parts: Vec<&str> = key.split('/').collect();
     if parts.is_empty() {
         return;
     }
 
-    // Navigate to parent, then insert sibling ":block" key
-    let mut current = obj as *mut serde_json::Map<String, serde_json::Value>;
+    let mut current = obj;
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
-            // At the leaf — insert ":block" at this level
             let block_key = format!("{}:block", part);
-            unsafe {
-                (*current).insert(block_key, serde_json::json!(block_height));
-            }
+            current.insert(block_key, serde_json::json!(block_height));
         } else {
-            unsafe {
-                if let Some(serde_json::Value::Object(ref mut nested)) = (*current).get_mut(*part) {
-                    current = nested as *mut serde_json::Map<String, serde_json::Value>;
-                } else {
-                    return;
+            match current.get_mut(*part) {
+                Some(serde_json::Value::Object(nested)) => {
+                    current = nested;
                 }
+                _ => return,
             }
         }
     }

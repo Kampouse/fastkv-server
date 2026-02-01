@@ -375,11 +375,9 @@ The `exclude_null` parameter filters entries where the value field equals the st
 The API is configured with the following CORS settings:
 
 - **Allowed origins:** Any (`*`)
-- **Allowed methods:** `GET` only
+- **Allowed methods:** `GET`, `POST`
 - **Allowed headers:** `Content-Type`, `Authorization`, `Accept`
 - **Preflight cache:** 1 hour (3600 seconds)
-
-**Note:** Only GET requests are allowed. POST, PUT, DELETE, and other methods will be rejected with a CORS error.
 
 ## Response Compression
 
