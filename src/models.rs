@@ -127,6 +127,11 @@ pub struct QueryResponse {
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
+pub struct TreeResponse {
+    pub tree: serde_json::Value,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct HealthResponse {
     pub status: String,
 }
@@ -166,6 +171,8 @@ pub struct QueryParams {
     pub offset: usize,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
+    #[serde(default)]
+    pub format: Option<String>, // "tree" for nested JSON response
 }
 
 impl QueryParams {

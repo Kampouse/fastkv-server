@@ -1,5 +1,6 @@
 use actix_web::{get, post, web, HttpResponse};
 use crate::models::*;
+use crate::tree::build_tree;
 use crate::AppState;
 
 const PROJECT_ID: &str = "fastkv-server";
@@ -166,6 +167,15 @@ pub async fn query_kv_handler(
         }
     }
 
+    // Validate format parameter
+    if let Some(ref fmt) = query.format {
+        if fmt != "tree" {
+            return Err(ApiError::InvalidParameter(
+                "format must be 'tree' or omitted".to_string(),
+            ));
+        }
+    }
+
     tracing::info!(
         target: PROJECT_ID,
         predecessor_id = %query.predecessor_id,
@@ -180,6 +190,16 @@ pub async fn query_kv_handler(
         .scylladb
         .query_kv_with_pagination(&query)
         .await?;
+
+    // Tree format: transform flat entries into nested JSON
+    if query.format.as_deref() == Some("tree") {
+        let items: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|e| (e.key, e.value))
+            .collect();
+        let tree = build_tree(&items);
+        return Ok(HttpResponse::Ok().json(TreeResponse { tree }));
+    }
 
     // Apply field selection
     let fields = query.parse_fields();

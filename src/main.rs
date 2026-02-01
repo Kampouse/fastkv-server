@@ -2,6 +2,7 @@ mod handlers;
 mod models;
 mod queries;
 mod scylladb;
+mod tree;
 
 use crate::handlers::{batch_kv_handler, count_kv_handler, get_kv_handler, health_check, history_kv_handler, query_kv_handler, reverse_kv_handler};
 use crate::scylladb::ScyllaDb;
@@ -42,6 +43,7 @@ const PROJECT_ID: &str = "fastkv-server";
         models::BatchQuery,
         models::BatchResultItem,
         models::BatchResponse,
+        models::TreeResponse,
     )),
     info(
         title = "FastKV API",
