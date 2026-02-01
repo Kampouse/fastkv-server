@@ -315,6 +315,8 @@ pub struct BatchResponse {
 pub struct SocialGetBody {
     pub keys: Vec<String>,
     #[serde(default)]
+    pub contract_id: Option<String>,
+    #[serde(default)]
     pub options: Option<SocialGetOptions>,
 }
 
@@ -330,6 +332,8 @@ pub struct SocialGetOptions {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct SocialKeysBody {
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
     #[serde(default)]
     pub options: Option<SocialKeysOptions>,
 }
@@ -355,6 +359,8 @@ pub struct SocialIndexParams {
     pub limit: usize,
     #[serde(default)]
     pub from: Option<u64>, // block_height cursor
+    #[serde(default)]
+    pub contract_id: Option<String>,
 }
 
 // GET /v1/social/profile query params
@@ -362,6 +368,8 @@ pub struct SocialIndexParams {
 pub struct SocialProfileParams {
     #[serde(alias = "accountId")]
     pub account_id: String,
+    #[serde(default)]
+    pub contract_id: Option<String>,
 }
 
 // GET /v1/social/followers and /v1/social/following query params
@@ -373,6 +381,8 @@ pub struct SocialFollowParams {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+    #[serde(default)]
+    pub contract_id: Option<String>,
 }
 
 // GET /v1/social/feed/account query params
@@ -386,6 +396,8 @@ pub struct SocialAccountFeedParams {
     pub limit: usize,
     #[serde(default)]
     pub from: Option<u64>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
 }
 
 // Social API response types

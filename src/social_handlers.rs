@@ -12,6 +12,10 @@ static SOCIAL_CONTRACT: LazyLock<String> = LazyLock::new(|| {
     std::env::var("SOCIAL_CONTRACT").unwrap_or_else(|_| "social.near".to_string())
 });
 
+fn resolve_contract(contract_id: &Option<String>) -> &str {
+    contract_id.as_deref().unwrap_or(&SOCIAL_CONTRACT)
+}
+
 // ===== Key pattern parsing =====
 
 enum KeyPattern {
@@ -94,6 +98,7 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
 
 async fn query_index(
     app_state: &AppState,
+    contract_id: &str,
     action: &str,
     key: &str,
     order: &str,
@@ -107,7 +112,7 @@ async fn query_index(
         .scylla_session
         .execute_iter(
             app_state.scylladb.reverse_kv.clone(),
-            (SOCIAL_CONTRACT.as_str(), &index_key),
+            (contract_id, &index_key),
         )
         .await
         .map_err(anyhow::Error::from)?
@@ -210,6 +215,7 @@ pub async fn social_get_handler(
         ));
     }
 
+    let contract = resolve_contract(&body.contract_id);
     let with_block_height = body.options.as_ref()
         .and_then(|o| o.with_block_height)
         .unwrap_or(false);
@@ -217,7 +223,7 @@ pub async fn social_get_handler(
         .and_then(|o| o.return_deleted)
         .unwrap_or(false);
 
-    tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), "POST /v1/social/get");
+    tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/get");
 
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
@@ -228,7 +234,7 @@ pub async fn social_get_handler(
         match parsed {
             KeyPattern::Exact { account_id, key } => {
                 let entry = app_state.scylladb
-                    .get_kv(&account_id, &SOCIAL_CONTRACT, &key)
+                    .get_kv(&account_id, contract, &key)
                     .await?;
 
                 if let Some(entry) = entry {
@@ -257,7 +263,7 @@ pub async fn social_get_handler(
             KeyPattern::RecursiveWildcard { account_id, key_prefix } => {
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    current_account_id: contract.to_string(),
                     key_prefix: if key_prefix.is_empty() { None } else { Some(key_prefix) },
                     exclude_null: if return_deleted { Some(false) } else { Some(true) },
                     limit: MAX_SOCIAL_RESULTS,
@@ -291,7 +297,7 @@ pub async fn social_get_handler(
             KeyPattern::SingleWildcard { account_id, key_prefix } => {
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    current_account_id: contract.to_string(),
                     key_prefix: Some(key_prefix.clone()),
                     exclude_null: if return_deleted { Some(false) } else { Some(true) },
                     limit: MAX_SOCIAL_RESULTS,
@@ -327,7 +333,7 @@ pub async fn social_get_handler(
                 // Use by-key view to find all predecessors with this exact key
                 let by_key_params = ByKeyParams {
                     key: key.clone(),
-                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    current_account_id: contract.to_string(),
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
@@ -382,6 +388,7 @@ pub async fn social_keys_handler(
         ));
     }
 
+    let contract = resolve_contract(&body.contract_id);
     let return_block_height = body.options.as_ref()
         .and_then(|o| o.return_type.as_deref())
         .map(|t| t == "BlockHeight")
@@ -393,7 +400,7 @@ pub async fn social_keys_handler(
         .and_then(|o| o.values_only)
         .unwrap_or(false);
 
-    tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), "POST /v1/social/keys");
+    tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/keys");
 
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
@@ -404,7 +411,7 @@ pub async fn social_keys_handler(
         match parsed {
             KeyPattern::Exact { account_id, key } => {
                 let entry = app_state.scylladb
-                    .get_kv(&account_id, &SOCIAL_CONTRACT, &key)
+                    .get_kv(&account_id, contract, &key)
                     .await?;
 
                 if let Some(entry) = entry {
@@ -432,7 +439,7 @@ pub async fn social_keys_handler(
                 // unless return_deleted is explicitly false AND values_only is set
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
-                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    current_account_id: contract.to_string(),
                     key_prefix: if key_prefix.is_empty() { None } else { Some(key_prefix.clone()) },
                     exclude_null: Some(false),
                     limit: MAX_SOCIAL_RESULTS,
@@ -521,7 +528,7 @@ pub async fn social_keys_handler(
             KeyPattern::WildcardAccount { key } => {
                 let by_key_params = ByKeyParams {
                     key: key.clone(),
-                    current_account_id: SOCIAL_CONTRACT.clone(),
+                    current_account_id: contract.to_string(),
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
@@ -582,10 +589,11 @@ pub async fn social_index_handler(
         return Err(ApiError::InvalidParameter("key cannot be empty".to_string()));
     }
     validate_limit(query.limit)?;
+    let contract = resolve_contract(&query.contract_id);
 
-    tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, "GET /v1/social/index");
+    tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, contract_id = %contract, "GET /v1/social/index");
 
-    let entries = query_index(&app_state, &query.action, &query.key, &query.order, query.limit, query.from).await?;
+    let entries = query_index(&app_state, contract, &query.action, &query.key, &query.order, query.limit, query.from).await?;
 
     Ok(HttpResponse::Ok().json(IndexResponse { entries }))
 }
@@ -609,12 +617,13 @@ pub async fn social_profile_handler(
     if query.account_id.is_empty() {
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
+    let contract = resolve_contract(&query.contract_id);
 
-    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/profile");
+    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/profile");
 
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.clone(),
+        current_account_id: contract.to_string(),
         key_prefix: Some("profile/".to_string()),
         exclude_null: Some(true),
         limit: MAX_SOCIAL_RESULTS,
@@ -657,14 +666,15 @@ pub async fn social_followers_handler(
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
     validate_limit(query.limit)?;
+    let contract = resolve_contract(&query.contract_id);
 
-    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/followers");
+    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/followers");
 
-    // Followers are accounts that wrote key "graph/follow/{accountId}" to social.near
+    // Followers are accounts that wrote key "graph/follow/{accountId}" to the contract
     let follow_key = format!("graph/follow/{}", query.account_id);
 
     let params = AccountsParams {
-        current_account_id: SOCIAL_CONTRACT.clone(),
+        current_account_id: contract.to_string(),
         key: follow_key,
         exclude_null: Some(true),
         limit: query.limit,
@@ -697,13 +707,14 @@ pub async fn social_following_handler(
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
     validate_limit(query.limit)?;
+    let contract = resolve_contract(&query.contract_id);
 
-    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/following");
+    tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/following");
 
-    // Following are keys under "graph/follow/" written by this account to social.near
+    // Following are keys under "graph/follow/" written by this account to the contract
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.clone(),
+        current_account_id: contract.to_string(),
         key_prefix: Some("graph/follow/".to_string()),
         exclude_null: Some(true),
         limit: query.limit,
@@ -743,13 +754,14 @@ pub async fn social_account_feed_handler(
         return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
     }
     validate_limit(query.limit)?;
+    let contract = resolve_contract(&query.contract_id);
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/feed/account");
 
     // Query history for post/main key to get all posts with their block heights
     let history_params = HistoryParams {
         predecessor_id: query.account_id.clone(),
-        current_account_id: SOCIAL_CONTRACT.clone(),
+        current_account_id: contract.to_string(),
         key: "post/main".to_string(),
         limit: query.limit,
         order: query.order.clone(),
