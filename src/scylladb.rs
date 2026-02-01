@@ -159,7 +159,7 @@ impl ScyllaDb {
             ).await?,
             by_key: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM {} WHERE key = ? AND current_account_id = ?", columns, by_key_view_name),
+                &format!("SELECT {} FROM {} WHERE key = ?", columns, by_key_view_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             scylla_session,
@@ -237,7 +237,7 @@ impl ScyllaDb {
             .scylla_session
             .execute_iter(
                 self.by_key.clone(),
-                (&params.key, &params.current_account_id),
+                (&params.key,),
             )
             .await?
             .rows_stream::<KvRow>()?;
@@ -259,6 +259,12 @@ impl ScyllaDb {
             };
 
             let entry = KvEntry::from(row);
+
+            // Filter by current_account_id in application layer
+            // (can't filter in CQL due to clustering column order)
+            if entry.current_account_id != params.current_account_id {
+                continue;
+            }
 
             if skipped < params.offset {
                 skipped += 1;
