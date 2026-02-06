@@ -2,7 +2,7 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::statement::prepared::PreparedStatement;
 
-use crate::models::{AccountsParams, ByKeyParams, HistoryParams, KvEntry, KvHistoryRow, KvPredecessorRow, KvRow, QueryParams, ReverseParams, TimelineParams, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN};
+use crate::models::{AccountsParams, ByKeyParams, ContractAccountRow, HistoryParams, KvEntry, KvHistoryRow, KvPredecessorRow, KvRow, QueryParams, ReverseParams, TimelineParams, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN};
 use crate::queries::build_prefix_query;
 use fastnear_primitives::types::ChainId;
 use rustls::pki_types::pem::PemObject;
@@ -11,6 +11,14 @@ use futures::stream::StreamExt;
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
+
+/// Validate that a CQL identifier (keyspace/table name) contains only safe characters.
+pub(crate) fn validate_identifier(name: &str, label: &str) -> anyhow::Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("{} must contain only alphanumeric characters and underscores: {}", label, name);
+    }
+    Ok(())
+}
 
 pub struct ScyllaDb {
     get_kv: PreparedStatement,
@@ -22,12 +30,15 @@ pub struct ScyllaDb {
     get_kv_timeline: PreparedStatement,
     by_key: PreparedStatement,
     accounts_by_key: PreparedStatement,
+    accounts_by_contract: PreparedStatement,
+    accounts_by_contract_key: PreparedStatement,
 
     pub scylla_session: Session,
     pub table_name: String,
     pub history_table_name: String,
     pub reverse_view_name: String,
     pub by_key_view_name: String,
+    pub kv_accounts_table_name: String,
 }
 
 pub fn create_rustls_client_config() -> anyhow::Result<Arc<ClientConfig>> {
@@ -117,8 +128,10 @@ impl ScyllaDb {
         let keyspace = env::var("KEYSPACE")
             .unwrap_or_else(|_| format!("fastdata_{chain_id}"));
 
+        validate_identifier(&keyspace, "KEYSPACE")?;
+
         scylla_session
-            .use_keyspace(keyspace, false)
+            .use_keyspace(&keyspace, false)
             .await?;
 
         // Support custom table names
@@ -130,6 +143,14 @@ impl ScyllaDb {
             .unwrap_or_else(|_| "mv_kv_cur_key".to_string());
         let by_key_view_name = env::var("BY_KEY_VIEW_NAME")
             .unwrap_or_else(|_| "mv_kv_key".to_string());
+        let kv_accounts_table_name = env::var("KV_ACCOUNTS_TABLE_NAME")
+            .unwrap_or_else(|_| "kv_accounts".to_string());
+
+        validate_identifier(&table_name, "TABLE_NAME")?;
+        validate_identifier(&history_table_name, "HISTORY_TABLE_NAME")?;
+        validate_identifier(&reverse_view_name, "REVERSE_VIEW_NAME")?;
+        validate_identifier(&by_key_view_name, "BY_KEY_VIEW_NAME")?;
+        validate_identifier(&kv_accounts_table_name, "KV_ACCOUNTS_TABLE_NAME")?;
 
         let columns = "predecessor_id, current_account_id, key, value, block_height, block_timestamp, receipt_id, tx_hash";
         let history_columns = "predecessor_id, current_account_id, key, block_height, order_id, value, block_timestamp, receipt_id, tx_hash, signer_id, shard_id, receipt_index, action_index";
@@ -180,11 +201,24 @@ impl ScyllaDb {
                 &format!("SELECT predecessor_id, value FROM {} WHERE current_account_id = ? AND key = ?", reverse_view_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
+            // LocalQuorum for kv_accounts: this table is populated asynchronously so
+            // LocalOne reads could return stale/partial results after recent writes.
+            accounts_by_contract: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT predecessor_id FROM {} WHERE current_account_id = ?", kv_accounts_table_name),
+                scylla::frame::types::Consistency::LocalQuorum,
+            ).await?,
+            accounts_by_contract_key: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT predecessor_id FROM {} WHERE current_account_id = ? AND key = ?", kv_accounts_table_name),
+                scylla::frame::types::Consistency::LocalQuorum,
+            ).await?,
             scylla_session,
             table_name,
             history_table_name,
             reverse_view_name,
             by_key_view_name,
+            kv_accounts_table_name,
         })
     }
 
@@ -355,6 +389,85 @@ impl ScyllaDb {
             .collect();
 
         Ok(result)
+    }
+
+    /// Returns `(accounts, truncated)` where `truncated` is true if the scan hit MAX_DEDUP_SCAN.
+    ///
+    /// When `key` is provided, the kv_accounts PK `(current_account_id, key, predecessor_id)`
+    /// guarantees uniqueness so no dedup is needed. Without a key filter, the same predecessor
+    /// can appear across different keys and must be deduplicated.
+    pub async fn query_accounts_by_contract(
+        &self,
+        contract_id: &str,
+        key: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<(Vec<String>, bool)> {
+        let needs_dedup = key.is_none();
+
+        let mut rows_stream = match key {
+            Some(k) => self
+                .scylla_session
+                .execute_iter(
+                    self.accounts_by_contract_key.clone(),
+                    (contract_id, k),
+                )
+                .await?
+                .rows_stream::<ContractAccountRow>()?,
+            None => self
+                .scylla_session
+                .execute_iter(
+                    self.accounts_by_contract.clone(),
+                    (contract_id,),
+                )
+                .await?
+                .rows_stream::<ContractAccountRow>()?,
+        };
+
+        let mut seen = HashSet::new();
+        let mut accounts = Vec::new();
+        let target_count = offset + limit;
+        let mut truncated = false;
+
+        while let Some(row_result) = rows_stream.next().await {
+            if needs_dedup && seen.len() >= MAX_DEDUP_SCAN {
+                truncated = true;
+                break;
+            }
+
+            let row = match row_result {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "fastkv-server",
+                        error = %e,
+                        "Failed to deserialize row in query_accounts_by_contract"
+                    );
+                    continue;
+                }
+            };
+
+            if needs_dedup {
+                if seen.contains(&row.predecessor_id) {
+                    continue;
+                }
+                seen.insert(row.predecessor_id.clone());
+            }
+
+            accounts.push(row.predecessor_id);
+
+            if accounts.len() >= target_count {
+                break;
+            }
+        }
+
+        let result: Vec<String> = accounts
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+
+        Ok((result, truncated))
     }
 
     pub async fn query_kv_with_pagination(
@@ -548,12 +661,12 @@ impl ScyllaDb {
             let entry = KvEntry::from(row);
 
             if let Some(from_block) = params.from_block {
-                if (entry.block_height as i64) < from_block {
+                if entry.block_height < (from_block.max(0) as u64) {
                     continue;
                 }
             }
             if let Some(to_block) = params.to_block {
-                if (entry.block_height as i64) > to_block {
+                if entry.block_height > (to_block.max(0) as u64) {
                     continue;
                 }
             }
@@ -619,12 +732,12 @@ impl ScyllaDb {
 
             // Apply block height range filters if specified
             if let Some(from_block) = params.from_block {
-                if (entry.block_height as i64) < from_block {
+                if entry.block_height < (from_block.max(0) as u64) {
                     continue;
                 }
             }
             if let Some(to_block) = params.to_block {
-                if (entry.block_height as i64) > to_block {
+                if entry.block_height > (to_block.max(0) as u64) {
                     continue;
                 }
             }
@@ -647,4 +760,27 @@ impl ScyllaDb {
         Ok(entries)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_identifier_accepts_valid() {
+        assert!(validate_identifier("fastdata_mainnet", "TEST").is_ok());
+        assert!(validate_identifier("s_kv_last", "TEST").is_ok());
+        assert!(validate_identifier("mv_kv_by_contract", "TEST").is_ok());
+        assert!(validate_identifier("A1_b2", "TEST").is_ok());
+    }
+
+    #[test]
+    fn test_validate_identifier_rejects_injection() {
+        assert!(validate_identifier("; DROP TABLE users", "TEST").is_err());
+        assert!(validate_identifier("table; --", "TEST").is_err());
+        assert!(validate_identifier("name with spaces", "TEST").is_err());
+        assert!(validate_identifier("", "TEST").is_err());
+        assert!(validate_identifier("table.name", "TEST").is_err());
+        assert!(validate_identifier("name-with-dashes", "TEST").is_err());
+    }
 }

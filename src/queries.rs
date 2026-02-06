@@ -1,7 +1,7 @@
 use scylla::frame::types::Consistency;
 use scylla::statement::Statement;
 
-pub fn build_prefix_query(prefix: &str, table_name: &str) -> (Statement, String, String) {
+pub(crate) fn build_prefix_query(prefix: &str, table_name: &str) -> (Statement, String, String) {
     let columns = "predecessor_id, current_account_id, key, value, block_height, block_timestamp, receipt_id, tx_hash";
     let query_text = format!(
         "SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key >= ? AND key < ?",
@@ -18,7 +18,7 @@ pub fn build_prefix_query(prefix: &str, table_name: &str) -> (Statement, String,
     (stmt, prefix_start, prefix_end)
 }
 
-pub fn compute_prefix_end(prefix: &str) -> String {
+pub(crate) fn compute_prefix_end(prefix: &str) -> String {
     // For prefix "graph/follow/", return "graph/follow/\xff"
     // This ensures we capture all keys starting with the prefix
     format!("{}\u{ff}", prefix)

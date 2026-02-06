@@ -1,7 +1,7 @@
 use actix_web::{get, post, web, HttpResponse};
 use futures::stream::StreamExt;
 
-use crate::handlers::require_db;
+use crate::handlers::{require_db, validate_account_id, validate_offset};
 use crate::models::*;
 use crate::tree::build_tree;
 use crate::AppState;
@@ -13,8 +13,14 @@ static SOCIAL_CONTRACT: LazyLock<String> = LazyLock::new(|| {
     std::env::var("SOCIAL_CONTRACT").unwrap_or_else(|_| "social.near".to_string())
 });
 
-fn resolve_contract(contract_id: &Option<String>) -> &str {
-    contract_id.as_deref().unwrap_or(&SOCIAL_CONTRACT)
+fn resolve_contract(contract_id: &Option<String>) -> Result<&str, ApiError> {
+    match contract_id {
+        Some(id) => {
+            validate_account_id(id, "contract_id")?;
+            Ok(id.as_str())
+        }
+        None => Ok(&SOCIAL_CONTRACT),
+    }
 }
 
 // ===== Key pattern parsing =====
@@ -75,7 +81,23 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
         ));
     }
 
-    if key_part.ends_with("/**") {
+    if key_part.len() > MAX_KEY_LENGTH {
+        return Err(ApiError::InvalidParameter(
+            format!("key pattern cannot exceed {} characters", MAX_KEY_LENGTH),
+        ));
+    }
+
+    if key_part == "**" {
+        Ok(KeyPattern::RecursiveWildcard {
+            account_id: account_part.to_string(),
+            key_prefix: String::new(),
+        })
+    } else if key_part == "*" {
+        Ok(KeyPattern::SingleWildcard {
+            account_id: account_part.to_string(),
+            key_prefix: String::new(),
+        })
+    } else if key_part.ends_with("/**") {
         let prefix = &key_part[..key_part.len() - 2]; // strip "**", keep trailing "/"
         Ok(KeyPattern::RecursiveWildcard {
             account_id: account_part.to_string(),
@@ -113,7 +135,7 @@ async fn query_index(q: IndexQuery<'_>) -> Result<Vec<IndexEntry>, ApiError> {
     let index_key = format!("index/{}/{}", action, key);
 
     let db = require_db(app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let mut rows_stream = scylladb
         .scylla_session
         .execute_iter(
@@ -138,8 +160,9 @@ async fn query_index(q: IndexQuery<'_>) -> Result<Vec<IndexEntry>, ApiError> {
                         error_count += 1;
                         tracing::warn!(target: PROJECT_ID, error = %e, "Failed to deserialize row in query_index");
                         if error_count >= MAX_STREAM_ERRORS {
+                            tracing::error!(target: PROJECT_ID, error_count, "Aborting query_index: too many deserialization errors");
                             return Err(ApiError::DatabaseError(
-                                format!("Too many deserialization errors ({}) in query_index", error_count),
+                                "An internal database error occurred".to_string(),
                             ));
                         }
                         continue;
@@ -228,7 +251,7 @@ pub async fn social_get_handler(
         ));
     }
 
-    let contract = resolve_contract(&body.contract_id);
+    let contract = resolve_contract(&body.contract_id)?;
     let with_block_height = body.options.as_ref()
         .and_then(|o| o.with_block_height)
         .unwrap_or(false);
@@ -239,7 +262,7 @@ pub async fn social_get_handler(
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/get");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
 
@@ -313,7 +336,7 @@ pub async fn social_get_handler(
                 let query = QueryParams {
                     predecessor_id: account_id.clone(),
                     current_account_id: contract.to_string(),
-                    key_prefix: Some(key_prefix.clone()),
+                    key_prefix: if key_prefix.is_empty() { None } else { Some(key_prefix.clone()) },
                     exclude_null: if return_deleted { Some(false) } else { Some(true) },
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
@@ -403,7 +426,7 @@ pub async fn social_keys_handler(
         ));
     }
 
-    let contract = resolve_contract(&body.contract_id);
+    let contract = resolve_contract(&body.contract_id)?;
     let return_block_height = body.options.as_ref()
         .and_then(|o| o.return_type.as_deref())
         .map(|t| t == "BlockHeight")
@@ -418,7 +441,7 @@ pub async fn social_keys_handler(
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/keys");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
 
@@ -507,17 +530,32 @@ pub async fn social_keys_handler(
                     "social_keys after return_deleted filter"
                 );
 
+                // Build set of parent prefixes for O(n) filtering instead of O(n²)
+                // A key like "a/b/c" contributes prefixes: "a/", "a/b/"
+                let parent_prefixes: std::collections::HashSet<String> = if values_only {
+                    entries.iter()
+                        .flat_map(|e| {
+                            let parts: Vec<_> = e.key.split('/').collect();
+                            (0..parts.len().saturating_sub(1))
+                                .map(move |i| format!("{}/", parts[..=i].join("/")))
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+
+                let before_values_only = after_deleted.len();
                 let filtered: Vec<&KvEntry> = after_deleted.into_iter()
                     .filter(|e| {
                         if !values_only { return true; }
-                        let prefix = format!("{}/", e.key);
-                        !entries.iter().any(|other| other.key.starts_with(&prefix))
+                        // Keep entry if it's NOT a parent of any other entry
+                        !parent_prefixes.contains(&format!("{}/", e.key))
                     })
                     .copied()
                     .collect();
                 tracing::debug!(
                     target: PROJECT_ID,
-                    before = after_depth.len(),
+                    before = before_values_only,
                     after = filtered.len(),
                     values_only,
                     remaining_keys = ?filtered.iter().map(|e| &e.key).collect::<Vec<_>>(),
@@ -606,7 +644,7 @@ pub async fn social_index_handler(
         return Err(ApiError::InvalidParameter("key cannot be empty".to_string()));
     }
     validate_limit(query.limit)?;
-    let contract = resolve_contract(&query.contract_id);
+    let contract = resolve_contract(&query.contract_id)?;
 
     tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, contract_id = %contract, "GET /v1/social/index");
 
@@ -640,15 +678,13 @@ pub async fn social_profile_handler(
     query: web::Query<SocialProfileParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.account_id.is_empty() {
-        return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
-    }
-    let contract = resolve_contract(&query.contract_id);
+    validate_account_id(&query.account_id, "account_id")?;
+    let contract = resolve_contract(&query.contract_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/profile");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
         current_account_id: contract.to_string(),
@@ -690,16 +726,15 @@ pub async fn social_followers_handler(
     query: web::Query<SocialFollowParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.account_id.is_empty() {
-        return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
-    }
+    validate_account_id(&query.account_id, "account_id")?;
     validate_limit(query.limit)?;
-    let contract = resolve_contract(&query.contract_id);
+    validate_offset(query.offset)?;
+    let contract = resolve_contract(&query.contract_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/followers");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     // Followers are accounts that wrote key "graph/follow/{accountId}" to the contract
     let follow_key = format!("graph/follow/{}", query.account_id);
 
@@ -733,16 +768,15 @@ pub async fn social_following_handler(
     query: web::Query<SocialFollowParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.account_id.is_empty() {
-        return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
-    }
+    validate_account_id(&query.account_id, "account_id")?;
     validate_limit(query.limit)?;
-    let contract = resolve_contract(&query.contract_id);
+    validate_offset(query.offset)?;
+    let contract = resolve_contract(&query.contract_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/following");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     // Following are keys under "graph/follow/" written by this account to the contract
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
@@ -782,16 +816,14 @@ pub async fn social_account_feed_handler(
     query: web::Query<SocialAccountFeedParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    if query.account_id.is_empty() {
-        return Err(ApiError::InvalidParameter("account_id cannot be empty".to_string()));
-    }
+    validate_account_id(&query.account_id, "account_id")?;
     validate_limit(query.limit)?;
-    let contract = resolve_contract(&query.contract_id);
+    let contract = resolve_contract(&query.contract_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/feed/account");
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let from_block = query.from.map(|f| i64::try_from(f).unwrap_or(i64::MAX));
     let include_replies = query.include_replies.unwrap_or(false);
 
@@ -931,6 +963,28 @@ mod tests {
             KeyPattern::SingleWildcard { account_id, key_prefix } => {
                 assert_eq!(account_id, "alice.near");
                 assert_eq!(key_prefix, "profile/");
+            }
+            _ => panic!("Expected SingleWildcard"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bare_recursive_wildcard() {
+        match parse_social_key("alice.near/**").unwrap() {
+            KeyPattern::RecursiveWildcard { account_id, key_prefix } => {
+                assert_eq!(account_id, "alice.near");
+                assert_eq!(key_prefix, "");
+            }
+            _ => panic!("Expected RecursiveWildcard"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bare_single_wildcard() {
+        match parse_social_key("alice.near/*").unwrap() {
+            KeyPattern::SingleWildcard { account_id, key_prefix } => {
+                assert_eq!(account_id, "alice.near");
+                assert_eq!(key_prefix, "");
             }
             _ => panic!("Expected SingleWildcard"),
         }

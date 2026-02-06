@@ -55,6 +55,12 @@ pub struct KvPredecessorRow {
     pub value: String,
 }
 
+// Lightweight row for contract-based account queries (predecessor_id only)
+#[derive(DeserializeRow, Debug, Clone)]
+pub struct ContractAccountRow {
+    pub predecessor_id: String,
+}
+
 // API response - keeps NEAR/FastData field names for compatibility
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct KvEntry {
@@ -157,6 +163,14 @@ pub struct QueryResponse {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct TreeResponse {
     pub tree: serde_json::Value,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct AccountsResponse {
+    pub accounts: Vec<String>,
+    pub count: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -269,6 +283,25 @@ pub struct AccountsParams {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+}
+
+// Accounts-by-contract query parameters
+#[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct AccountsQueryParams {
+    /// Contract account to query. Defaults to "contextual.near" (note: social endpoints default to "social.near").
+    #[serde(default = "default_contract_id")]
+    pub contract_id: String,
+    /// Optional key filter. Recommended for large contracts to avoid expensive full-partition scans.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_contract_id() -> String {
+    "contextual.near".to_string()
 }
 
 // By-key query parameters (reverse lookup by exact key across all predecessors)
@@ -505,12 +538,14 @@ impl ResponseError for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
+        // Log full error internally for debugging, but return generic message to client
+        // to prevent information disclosure (paths, IPs, schema details)
         tracing::error!(
             target: "fastkv-server",
             error = %err,
             "Database error occurred"
         );
-        ApiError::DatabaseError(err.to_string())
+        ApiError::DatabaseError("An internal database error occurred".to_string())
     }
 }
 

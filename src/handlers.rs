@@ -75,6 +75,7 @@ footer a:hover{text-decoration:underline}
 <li><a href="/docs"><code>GET</code> /v1/kv/history</a></li>
 <li><a href="/docs"><code>GET</code> /v1/kv/reverse</a></li>
 <li><a href="/docs"><code>GET</code> /v1/kv/by-key</a></li>
+<li><a href="/docs"><code>GET</code> /v1/kv/accounts</a></li>
 <li><a href="/docs"><code>GET</code> /v1/kv/diff</a></li>
 <li><a href="/docs"><code>GET</code> /v1/kv/timeline</a></li>
 <li><a href="/docs"><code>POST</code> /v1/kv/batch</a></li>
@@ -114,7 +115,7 @@ fn respond_with_entries(entries: Vec<KvEntry>, fields: &Option<HashSet<String>>)
     }
 }
 
-fn validate_account_id(value: &str, name: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_account_id(value: &str, name: &str) -> Result<(), ApiError> {
     if value.is_empty() {
         return Err(ApiError::InvalidParameter(format!("{} cannot be empty", name)));
     }
@@ -126,7 +127,7 @@ fn validate_account_id(value: &str, name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_key(value: &str, name: &str, max_len: usize) -> Result<(), ApiError> {
+pub(crate) fn validate_key(value: &str, name: &str, max_len: usize) -> Result<(), ApiError> {
     if value.is_empty() {
         return Err(ApiError::InvalidParameter(format!("{} cannot be empty", name)));
     }
@@ -138,7 +139,7 @@ fn validate_key(value: &str, name: &str, max_len: usize) -> Result<(), ApiError>
     Ok(())
 }
 
-fn validate_offset(offset: usize) -> Result<(), ApiError> {
+pub(crate) fn validate_offset(offset: usize) -> Result<(), ApiError> {
     if offset > MAX_OFFSET {
         return Err(ApiError::InvalidParameter(
             format!("offset cannot exceed {}", MAX_OFFSET),
@@ -226,7 +227,7 @@ pub async fn get_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entry = db.as_ref().unwrap()
+    let entry = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .get_kv(&query.predecessor_id, &query.current_account_id, &query.key)
         .await?;
 
@@ -279,7 +280,7 @@ pub async fn query_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().unwrap()
+    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .query_kv_with_pagination(&query)
         .await?;
 
@@ -346,7 +347,7 @@ pub async fn history_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().unwrap()
+    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .get_kv_history(&query)
         .await?;
 
@@ -385,7 +386,7 @@ pub async fn reverse_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().unwrap()
+    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .reverse_kv_with_dedup(&query)
         .await?;
 
@@ -424,12 +425,65 @@ pub async fn by_key_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().unwrap()
+    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .query_by_key(&query)
         .await?;
 
     let fields = parse_field_set(&query.fields);
     Ok(respond_with_entries(entries, &fields))
+}
+
+/// List unique writer accounts for a contract.
+///
+/// Returns deduplicated predecessor accounts that have written to the given contract.
+/// Providing a `key` filter is recommended — omitting it scans the entire contract partition
+/// which can be expensive for large contracts. Results are capped at 100,000 unique accounts;
+/// if this limit is reached the response will include `"truncated": true`.
+/// The `count` field reflects the number of accounts in the current page, not the total.
+#[utoipa::path(
+    get,
+    path = "/v1/kv/accounts",
+    params(AccountsQueryParams),
+    responses(
+        (status = 200, description = "List of writer accounts", body = AccountsResponse),
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
+    ),
+    tag = "kv"
+)]
+#[get("/v1/kv/accounts")]
+pub async fn accounts_handler(
+    query: web::Query<AccountsQueryParams>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    validate_account_id(&query.contract_id, "contract_id")?;
+    validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
+    if let Some(ref key) = query.key {
+        validate_key(key, "key", MAX_KEY_LENGTH)?;
+    }
+
+    tracing::info!(
+        target: PROJECT_ID,
+        contract_id = %query.contract_id,
+        key = ?query.key,
+        limit = query.limit,
+        offset = query.offset,
+        "GET /v1/kv/accounts"
+    );
+
+    let db = require_db(&app_state).await?;
+    let (accounts, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+        .query_accounts_by_contract(
+            &query.contract_id,
+            query.key.as_deref(),
+            query.limit,
+            query.offset,
+        )
+        .await?;
+
+    let count = accounts.len();
+    Ok(HttpResponse::Ok().json(AccountsResponse { accounts, count, truncated }))
 }
 
 /// Compare a key's value at two different block heights
@@ -463,7 +517,7 @@ pub async fn diff_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().unwrap();
+    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let (a, b) = futures::future::try_join(
         scylladb.get_kv_at_block(
             &query.predecessor_id, &query.current_account_id, &query.key, query.block_height_a,
@@ -533,7 +587,7 @@ pub async fn timeline_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().unwrap()
+    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .get_kv_timeline(&query)
         .await?;
 
@@ -596,7 +650,14 @@ pub async fn batch_kv_handler(
         let key = key.clone();
         async move {
             let guard = scylladb.read().await;
-            let db = guard.as_ref().unwrap();
+            let Some(db) = guard.as_ref() else {
+                return BatchResultItem {
+                    key,
+                    found: false,
+                    value: None,
+                    error: Some("Database unavailable".to_string()),
+                };
+            };
             match db.get_kv_last(&predecessor_id, &current_account_id, &key).await {
                 Ok(value) => BatchResultItem {
                     key,
@@ -604,12 +665,16 @@ pub async fn batch_kv_handler(
                     value,
                     error: None,
                 },
-                Err(e) => BatchResultItem {
-                    key,
-                    found: false,
-                    value: None,
-                    error: Some(e.to_string()),
-                },
+                Err(e) => {
+                    // Log full error internally, return generic message to client
+                    tracing::warn!(target: PROJECT_ID, error = %e, key = %key, "Batch key lookup failed");
+                    BatchResultItem {
+                        key,
+                        found: false,
+                        value: None,
+                        error: Some("Lookup failed".to_string()),
+                    }
+                }
             }
         }
     }))

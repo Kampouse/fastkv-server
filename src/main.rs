@@ -5,7 +5,7 @@ mod scylladb;
 mod social_handlers;
 mod tree;
 
-use crate::handlers::{batch_kv_handler, by_key_handler, diff_kv_handler, get_kv_handler, health_check, history_kv_handler, index, query_kv_handler, reverse_kv_handler, timeline_kv_handler};
+use crate::handlers::{accounts_handler, batch_kv_handler, by_key_handler, diff_kv_handler, get_kv_handler, health_check, history_kv_handler, index, query_kv_handler, reverse_kv_handler, timeline_kv_handler};
 use crate::social_handlers::{
     social_get_handler, social_keys_handler, social_index_handler,
     social_profile_handler, social_followers_handler, social_following_handler,
@@ -37,6 +37,7 @@ use crate::models::PROJECT_ID;
         handlers::timeline_kv_handler,
         handlers::batch_kv_handler,
         handlers::by_key_handler,
+        handlers::accounts_handler,
         social_handlers::social_get_handler,
         social_handlers::social_keys_handler,
         social_handlers::social_index_handler,
@@ -63,6 +64,8 @@ use crate::models::PROJECT_ID;
         models::TimelineParams,
         models::ByKeyParams,
         models::AccountsParams,
+        models::AccountsQueryParams,
+        models::AccountsResponse,
         models::SocialGetBody,
         models::SocialGetOptions,
         models::SocialKeysBody,
@@ -135,11 +138,16 @@ async fn main() -> std::io::Result<()> {
     };
 
     // Background reconnection task
+    let reconnect_interval_secs: u64 = env::var("DB_RECONNECT_INTERVAL_SECS")
+        .unwrap_or_else(|_| "30".to_string())
+        .parse()
+        .unwrap_or(30)
+        .max(5);
     {
         let scylladb = Arc::clone(&scylladb);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(reconnect_interval_secs)).await;
                 if scylladb.read().await.is_some() {
                     continue;
                 }
@@ -202,6 +210,7 @@ async fn main() -> std::io::Result<()> {
             .service(diff_kv_handler)
             .service(timeline_kv_handler)
             .service(by_key_handler)
+            .service(accounts_handler)
             .service(social_get_handler)
             .service(social_keys_handler)
             .service(social_index_handler)
