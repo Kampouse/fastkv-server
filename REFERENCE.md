@@ -621,6 +621,31 @@ interface SocialAccountFeedParams {
 
 ---
 
+## Table Schemas (ScyllaDB)
+
+```
+s_kv_last       PRIMARY KEY ((predecessor_id), current_account_id, key)
+                → value, block_height, block_timestamp, receipt_id, tx_hash
+                Current-state table. One row per (writer, contract, key).
+
+s_kv            PRIMARY KEY ((predecessor_id), current_account_id, key, block_height, order_id)
+                → value, block_timestamp, receipt_id, tx_hash, signer_id, shard_id, receipt_index, action_index
+                History table. One row per write event.
+
+mv_kv_cur_key   Materialized view on s_kv_last
+                PRIMARY KEY ((current_account_id, key), predecessor_id)
+                Reverse lookup: find all writers for a given (contract, key).
+
+kv_accounts     PRIMARY KEY ((current_account_id), key, predecessor_id)
+                Contract-to-writer mapping. Populated asynchronously (reads use LocalQuorum).
+
+kv_edges        PRIMARY KEY ((edge_type, target), source)
+                → block_height
+                Reverse edge lookup: find all sources for an (edge_type, target).
+```
+
+---
+
 ## Internal Constants
 
 | Constant | Value | Location | Purpose |

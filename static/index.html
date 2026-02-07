@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NEAR Garden</title>
-<meta name="description" content="Read-only API for NEAR on-chain key-value data and SocialDB. No API key required.">
+<meta name="description" content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required.">
 <meta property="og:title" content="NEAR Garden">
-<meta property="og:description" content="Read-only API for NEAR on-chain key-value data and SocialDB. No API key required.">
+<meta property="og:description" content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://fastdata.up.railway.app">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="NEAR Garden">
-<meta name="twitter:description" content="Read-only API for NEAR on-chain key-value data and SocialDB. No API key required.">
+<meta name="twitter:description" content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required.">
 <link rel="canonical" href="https://fastdata.up.railway.app">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127793;</text></svg>">
 <link rel="stylesheet" href="/style.css">
@@ -24,6 +24,7 @@
   </div>
   <nav>
     <a href="/docs" class="nav-link">API Docs</a>
+    <span id="wallet-area" class="wallet-area"></span>
   </nav>
 </header>
 
@@ -31,16 +32,20 @@
   <div class="controls">
     <div class="contract-row">
       <label for="contract-input" class="label">contract</label>
-      <input id="contract-input" type="text" value="social.near" spellcheck="false">
+      <input id="contract-input" type="text" value="contextual.near" spellcheck="false">
     </div>
     <form id="explore-form" class="search-row">
       <input id="query-input" type="text" placeholder="root.near/profile/**" spellcheck="false">
+      <label class="all-accounts-toggle">
+        <input type="checkbox" id="all-accounts-check"> <span>all accounts</span>
+      </label>
       <button type="submit" id="explore-btn">explore_</button>
     </form>
     <div class="quick-paths" id="quick-paths">
       <button type="button" data-path="profile">profile</button>
       <button type="button" data-path="graph">graph</button>
       <button type="button" data-path="index">index</button>
+      <button type="button" data-path="recent" id="quick-recent">recent</button>
     </div>
   </div>
 
@@ -49,6 +54,7 @@
   <div class="view-toggle">
     <button type="button" id="view-tree" class="active" aria-pressed="true">tree</button>
     <button type="button" id="view-json" aria-pressed="false">json</button>
+    <button type="button" id="view-plant" aria-pressed="false" hidden>plant</button>
   </div>
 
   <div id="error-bar" class="error-bar" hidden>
@@ -65,17 +71,74 @@
       <pre id="detail-value" class="detail-value"></pre>
       <div id="detail-meta" class="detail-meta"></div>
     </div>
+    <div id="history-panel" class="panel history-panel" hidden>
+      <div class="history-title">history</div>
+      <div id="history-list" class="history-list"></div>
+      <div class="history-copy-bar copy-bar"></div>
+      <div class="diff-controls">
+        <select id="diff-select-a" class="diff-select"></select>
+        <span class="diff-vs">vs</span>
+        <select id="diff-select-b" class="diff-select"></select>
+        <button type="button" id="diff-btn">diff</button>
+      </div>
+      <pre id="diff-result" class="diff-result"></pre>
+      <div id="diff-copy-bar" class="copy-bar"></div>
+    </div>
   </div>
 
   <div id="json-panel" class="panel json-panel" hidden>
     <pre id="json-view"></pre>
   </div>
+
+  <!-- Plant panel -->
+  <div id="plant-panel" class="panel plant-panel" hidden>
+    <div class="plant-templates">
+      <span class="plant-label">templates</span>
+      <button type="button" onclick="applyTemplate('profile')">profile</button>
+      <button type="button" onclick="applyTemplate('post')">post</button>
+      <button type="button" onclick="applyTemplate('widget')">widget</button>
+      <button type="button" onclick="applyTemplate('raw')">raw</button>
+    </div>
+    <div class="plant-field">
+      <label for="plant-key" class="plant-label">key path</label>
+      <input id="plant-key" type="text" placeholder="recipes/carbonara" spellcheck="false" oninput="updatePlantPreview()">
+    </div>
+    <div class="plant-field">
+      <label for="plant-value" class="plant-label">value (JSON)</label>
+      <textarea id="plant-value" rows="8" spellcheck="false" placeholder='{ "ingredients": ["pasta", "eggs"] }'></textarea>
+    </div>
+    <div id="plant-preview" class="plant-preview"></div>
+    <button type="button" id="plant-btn" class="plant-btn" onclick="plantData()">plant_</button>
+    <div id="plant-status" class="plant-status"></div>
+  </div>
+
+  <!-- Feed panel (timeline) -->
+  <div id="feed-panel" class="panel feed-panel" hidden>
+    <div id="feed-list" class="feed-list"></div>
+  </div>
+
+  <!-- API Inspector -->
+  <div id="api-inspector" class="api-inspector" hidden>
+    <div class="inspector-toggle" role="button" tabindex="0" onclick="toggleInspector()">
+      <span class="inspector-arrow" id="inspector-arrow">&#9656;</span>
+      <span id="inspector-summary">API Call</span>
+      <button type="button" class="inspector-copy" id="inspector-copy" onclick="event.stopPropagation(); copyAsCurl()">copy curl</button>
+    </div>
+    <div id="inspector-detail" class="inspector-detail" hidden>
+      <pre id="inspector-body"></pre>
+    </div>
+  </div>
 </main>
 
 <footer>
-  <p>NEAR Directory is a demo app built using <a href="https://hackmd.io/@fastnear/__fastdata">FastData</a>. Powered by <a href="https://fastnear.com">FastNear</a>.</p>
+  <p>NEAR Garden is a demo app built using <a href="https://hackmd.io/@fastnear/__fastdata">FastData</a>. Powered by <a href="https://fastnear.com">FastNear</a>.</p>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/near-api-js@0.44.2/dist/near-api-js.min.js"></script>
 <script src="/app.js"></script>
+<script src="/wallet.js"></script>
+<script>
+  initNear().catch(e => console.warn('Wallet init failed:', e));
+</script>
 </body>
 </html>
