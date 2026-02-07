@@ -187,6 +187,9 @@ pub struct GetParams {
     pub key: String,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 /// Parse a comma-separated fields string into a set of field names.
@@ -224,6 +227,9 @@ pub struct QueryParams {
     pub fields: Option<String>, // Comma-separated field names
     #[serde(default)]
     pub format: Option<String>, // "tree" for nested JSON response
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 
@@ -245,6 +251,9 @@ pub struct WritersParams {
     pub offset: usize,
     #[serde(default)]
     pub fields: Option<String>,
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 
@@ -270,6 +279,9 @@ pub struct HistoryParams {
     pub to_block: Option<i64>,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 
@@ -322,6 +334,9 @@ pub struct DiffParams {
     pub block_height_b: i64,
     #[serde(default)]
     pub fields: Option<String>,
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -349,6 +364,9 @@ pub struct TimelineParams {
     pub to_block: Option<i64>,
     #[serde(default)]
     pub fields: Option<String>,
+    /// When true, JSON-decode the value field instead of returning the raw encoded string.
+    #[serde(default)]
+    pub decode: Option<bool>,
 }
 
 // Batch query structs

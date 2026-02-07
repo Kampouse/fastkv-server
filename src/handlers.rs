@@ -15,16 +15,36 @@ pub(crate) async fn require_db(state: &AppState) -> Result<RwLockReadGuard<'_, O
     Ok(guard)
 }
 
+/// Attempt to JSON-decode the `"value"` field in a serialized entry.
+/// If the value is a JSON string, it is parsed into the decoded JSON type
+/// (e.g., `"\"Alice\""` becomes `"Alice"`, `"42"` becomes `42`).
+fn decode_value_in_json(json: &mut serde_json::Value) {
+    if let Some(map) = json.as_object_mut() {
+        if let Some(raw) = map.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(&raw) {
+                map.insert("value".to_string(), decoded);
+            }
+        }
+    }
+}
+
 fn respond_paginated(
     entries: Vec<KvEntry>,
     has_more: bool,
     truncated: bool,
     fields: &Option<HashSet<String>>,
+    decode: bool,
 ) -> HttpResponse {
-    if fields.is_some() {
+    if fields.is_some() || decode {
         let filtered: Vec<_> = entries
             .into_iter()
-            .map(|e| e.to_json_with_fields(fields))
+            .map(|e| {
+                let mut json = e.to_json_with_fields(fields);
+                if decode {
+                    decode_value_in_json(&mut json);
+                }
+                json
+            })
             .collect();
         let mut resp = serde_json::json!({ "data": filtered, "has_more": has_more });
         if truncated {
@@ -156,10 +176,17 @@ pub async fn get_kv_handler(
         .get_kv(&query.predecessor_id, &query.current_account_id, &query.key)
         .await?;
 
-    // Apply field selection and return
+    // Apply field selection and optional value decoding
     let fields = parse_field_set(&query.fields);
+    let decode = query.decode.unwrap_or(false);
     match entry {
-        Some(entry) => Ok(HttpResponse::Ok().json(entry.to_json_with_fields(&fields))),
+        Some(entry) => {
+            let mut json = entry.to_json_with_fields(&fields);
+            if decode {
+                decode_value_in_json(&mut json);
+            }
+            Ok(HttpResponse::Ok().json(json))
+        }
         None => Ok(HttpResponse::Ok().json(serde_json::Value::Null)),
     }
 }
@@ -219,7 +246,8 @@ pub async fn query_kv_handler(
     }
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_paginated(entries, has_more, false, &fields))
+    let decode = query.decode.unwrap_or(false);
+    Ok(respond_paginated(entries, has_more, false, &fields, decode))
 }
 
 /// Get historical versions of a KV entry
@@ -281,7 +309,8 @@ pub async fn history_kv_handler(
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_paginated(entries, has_more, truncated, &fields))
+    let decode = query.decode.unwrap_or(false);
+    Ok(respond_paginated(entries, has_more, truncated, &fields, decode))
 }
 
 /// Find all writers for a key under a contract, with optional account filter
@@ -324,7 +353,8 @@ pub async fn writers_handler(
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_paginated(entries, has_more, truncated, &fields))
+    let decode = query.decode.unwrap_or(false);
+    Ok(respond_paginated(entries, has_more, truncated, &fields, decode))
 }
 
 /// List unique writer accounts for a contract.
@@ -425,11 +455,15 @@ pub async fn diff_kv_handler(
     ).await?;
 
     let fields = parse_field_set(&query.fields);
-    if fields.is_some() {
-        Ok(HttpResponse::Ok().json(serde_json::json!({
-            "a": a.as_ref().map(|e| e.to_json_with_fields(&fields)),
-            "b": b.as_ref().map(|e| e.to_json_with_fields(&fields)),
-        })))
+    let decode = query.decode.unwrap_or(false);
+    if fields.is_some() || decode {
+        let mut a_json = a.as_ref().map(|e| e.to_json_with_fields(&fields));
+        let mut b_json = b.as_ref().map(|e| e.to_json_with_fields(&fields));
+        if decode {
+            if let Some(ref mut v) = a_json { decode_value_in_json(v); }
+            if let Some(ref mut v) = b_json { decode_value_in_json(v); }
+        }
+        Ok(HttpResponse::Ok().json(serde_json::json!({ "a": a_json, "b": b_json })))
     } else {
         Ok(HttpResponse::Ok().json(DiffResponse { a, b }))
     }
@@ -494,7 +528,8 @@ pub async fn timeline_kv_handler(
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_paginated(entries, has_more, truncated, &fields))
+    let decode = query.decode.unwrap_or(false);
+    Ok(respond_paginated(entries, has_more, truncated, &fields, decode))
 }
 
 /// Batch lookup: get values for multiple keys in a single request

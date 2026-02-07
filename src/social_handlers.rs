@@ -311,6 +311,7 @@ pub async fn social_get_handler(
                     offset: 0,
                     fields: None,
                     format: None,
+                    decode: None,
                 };
 
                 let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
@@ -345,6 +346,7 @@ pub async fn social_get_handler(
                     offset: 0,
                     fields: None,
                     format: None,
+                    decode: None,
                 };
 
                 let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
@@ -380,6 +382,7 @@ pub async fn social_get_handler(
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
+                    decode: None,
                 };
                 let entries = scylladb.query_writers(&by_key_params).await?.0;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
@@ -492,6 +495,7 @@ pub async fn social_keys_handler(
                     offset: 0,
                     fields: None,
                     format: None,
+                    decode: None,
                 };
 
                 let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
@@ -595,6 +599,7 @@ pub async fn social_keys_handler(
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
+                    decode: None,
                 };
                 let entries = scylladb.query_writers(&by_key_params).await?.0;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
@@ -703,6 +708,7 @@ pub async fn social_profile_handler(
         offset: 0,
         fields: None,
         format: None,
+        decode: None,
     };
 
     let (entries, ..) = scylladb.query_kv_with_pagination(&params).await?;
@@ -795,6 +801,7 @@ pub async fn social_following_handler(
         offset: query.offset,
         fields: None,
         format: None,
+        decode: None,
     };
 
     let (entries, ..) = scylladb.query_kv_with_pagination(&params).await?;
@@ -850,6 +857,7 @@ pub async fn social_account_feed_handler(
         from_block,
         to_block: None,
         fields: None,
+        decode: None,
     };
 
     let comment_params = HistoryParams {
@@ -861,6 +869,7 @@ pub async fn social_account_feed_handler(
         from_block,
         to_block: None,
         fields: None,
+        decode: None,
     };
 
     let posts: Vec<IndexEntry> = if include_replies {

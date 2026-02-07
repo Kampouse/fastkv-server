@@ -15,10 +15,11 @@ use crate::social_handlers::{
 use crate::scylladb::ScyllaDb;
 use actix_cors::Cors;
 use actix_web::http::header;
-use actix_web::{middleware, web, App, HttpServer};
+use actix_web::{dev::Service, middleware, web, App, HttpServer};
 use dotenvy::dotenv;
 use fastnear_primitives::types::ChainId;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::OpenApi;
@@ -187,7 +188,26 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
+    // Background task to cache indexer block height for response headers
+    let indexer_block_cache = Arc::new(AtomicU64::new(0));
+    {
+        let cache = Arc::clone(&indexer_block_cache);
+        let scylladb = Arc::clone(&scylladb);
+        tokio::spawn(async move {
+            loop {
+                if let Some(db) = scylladb.read().await.as_ref() {
+                    if let Ok(Some(h)) = db.get_indexer_block_height().await {
+                        cache.store(h, Ordering::Relaxed);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     HttpServer::new(move || {
+        let block_cache = Arc::clone(&indexer_block_cache);
+
         // Configure CORS middleware
         let cors = Cors::default()
             .allow_any_origin()
@@ -197,7 +217,7 @@ async fn main() -> std::io::Result<()> {
                 header::AUTHORIZATION,
                 header::ACCEPT,
             ])
-            .expose_headers(vec!["X-Results-Truncated"])
+            .expose_headers(vec!["X-Results-Truncated", "X-Indexer-Block"])
             .max_age(3600);
 
         App::new()
@@ -206,6 +226,23 @@ async fn main() -> std::io::Result<()> {
                 chain_id,
             }))
             .wrap(cors)
+            .wrap_fn({
+                let cache = block_cache;
+                move |req, srv| {
+                    let h = cache.load(Ordering::Relaxed);
+                    let fut = srv.call(req);
+                    async move {
+                        let mut res = fut.await?;
+                        if h > 0 {
+                            res.headers_mut().insert(
+                                header::HeaderName::from_static("x-indexer-block"),
+                                header::HeaderValue::from(h),
+                            );
+                        }
+                        Ok(res)
+                    }
+                }
+            })
             .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::new(
                 "%{r}a \"%r\"	%s %b \"%{Referer}i\" \"%{User-Agent}i\" %T",
