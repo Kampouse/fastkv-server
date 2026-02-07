@@ -1,16 +1,111 @@
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::errors::NextRowError;
 use scylla::statement::prepared::PreparedStatement;
 
 use crate::models::{AccountsParams, ContractAccountRow, EdgeRow, EdgeSourceEntry, HistoryParams, KvEntry, KvHistoryRow, KvRow, QueryParams, WritersParams, TimelineParams, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN, bigint_to_u64};
 use crate::queries::{build_prefix_query, build_prefix_cursor_query};
 use fastnear_primitives::types::ChainId;
+use futures::stream::StreamExt;
+use futures::Stream;
 use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
-use futures::stream::StreamExt;
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
+
+/// Outcome of a paginated stream collection.
+#[derive(Debug)]
+pub struct PageResult<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+    pub truncated: bool,
+    pub dropped_rows: usize,
+}
+
+/// Collects rows from a typed stream with standard pagination semantics.
+///
+/// **Overfetch mode** (`scan_cap = None`):
+///   Skips `offset` valid items (those where `transform` returns `Some`),
+///   collects up to `limit + 1`, sets `has_more` from overfetch.
+///
+/// **Scan-cap mode** (`scan_cap = Some(cap)`):
+///   Collects ALL valid items up to `cap` raw rows scanned.
+///   Sets `truncated = true` if cap hit. Does NOT apply offset/limit
+///   (caller post-sorts then slices). `has_more` is left as `false`.
+pub async fn collect_page<T, R, S, F>(
+    stream: &mut S,
+    limit: usize,
+    offset: usize,
+    scan_cap: Option<usize>,
+    mut transform: F,
+) -> PageResult<T>
+where
+    S: Stream<Item = Result<R, NextRowError>> + Unpin,
+    F: FnMut(R) -> Option<T>,
+{
+    let mut items = match scan_cap {
+        None => Vec::with_capacity(limit + 1),
+        Some(_) => Vec::new(),
+    };
+    let mut dropped_rows = 0usize;
+    let mut skipped = 0usize;
+    let mut scanned = 0usize;
+    let mut truncated = false;
+
+    while let Some(row_result) = stream.next().await {
+        // Scan-cap check (before deser — matches current behavior)
+        if let Some(cap) = scan_cap {
+            scanned += 1;
+            if scanned > cap {
+                truncated = true;
+                break;
+            }
+        }
+
+        let row = match row_result {
+            Ok(r) => r,
+            Err(e) => {
+                dropped_rows += 1;
+                tracing::warn!(
+                    target: "fastkv-server",
+                    error = %e,
+                    "Failed to deserialize row"
+                );
+                continue;
+            }
+        };
+
+        // Transform + filter (None = filtered out, not counted for offset/limit)
+        let item = match transform(row) {
+            Some(item) => item,
+            None => continue,
+        };
+
+        // Offset skip (overfetch mode only)
+        if scan_cap.is_none() && skipped < offset {
+            skipped += 1;
+            continue;
+        }
+
+        items.push(item);
+
+        // Early break at limit+1 (overfetch mode only)
+        if scan_cap.is_none() && items.len() > limit {
+            break;
+        }
+    }
+
+    let has_more = if scan_cap.is_none() {
+        let over = items.len() > limit;
+        items.truncate(limit);
+        over
+    } else {
+        false // caller computes after post-sort + slice
+    };
+
+    PageResult { items, has_more, truncated, dropped_rows }
+}
 
 /// Validate that a CQL identifier (keyspace/table name) contains only safe characters.
 pub(crate) fn validate_identifier(name: &str, label: &str) -> anyhow::Result<()> {
@@ -320,11 +415,11 @@ impl ScyllaDb {
     /// predecessor_id is the clustering key so rows are naturally deduplicated.
     /// Supports cursor pagination via `after_account`.
     /// Optionally filters to a specific writer (predecessor_id).
-    /// Returns (entries, has_more, truncated).
+    /// Returns (entries, has_more, truncated, dropped_rows).
     pub async fn query_writers(
         &self,
         params: &WritersParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
         let mut rows_stream = match &params.after_account {
             Some(cursor) => {
                 self.scylla_session
@@ -340,58 +435,25 @@ impl ScyllaDb {
             }
         };
 
-        let mut entries = Vec::new();
-        let mut skipped = 0;
-
-        while let Some(row_result) = rows_stream.next().await {
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in query_writers"
-                    );
-                    continue;
-                }
-            };
-
+        let exclude_null = params.exclude_null.unwrap_or(false);
+        let pred_filter = params.predecessor_id.clone();
+        let offset = if params.after_account.is_some() { 0 } else { params.offset };
+        let page = collect_page(&mut rows_stream, params.limit, offset, None, |row: KvRow| {
             let entry = KvEntry::from(row);
-
-            // Filter by specific writer if requested
-            if let Some(ref pred) = params.predecessor_id {
-                if entry.predecessor_id != *pred {
-                    continue;
-                }
+            if let Some(ref pred) = pred_filter {
+                if entry.predecessor_id != *pred { return None; }
             }
+            if exclude_null && entry.value == "null" { return None; }
+            Some(entry)
+        }).await;
 
-            // Apply exclude_null filter
-            if params.exclude_null.unwrap_or(false) && entry.value == "null" {
-                continue;
-            }
-
-            // Apply offset only when not using cursor
-            if params.after_account.is_none() && skipped < params.offset {
-                skipped += 1;
-                continue;
-            }
-
-            entries.push(entry);
-            if entries.len() > params.limit {
-                break;
-            }
-        }
-
-        let has_more = entries.len() > params.limit;
-        entries.truncate(params.limit);
-
-        Ok((entries, has_more, false))
+        Ok((page.items, page.has_more, false, page.dropped_rows))
     }
 
     pub async fn query_accounts(
         &self,
         params: &AccountsParams,
-    ) -> anyhow::Result<(Vec<String>, bool)> {
+    ) -> anyhow::Result<(Vec<String>, bool, usize)> {
         // Use kv_reverse table for CQL-level cursor pagination
         let mut rows_stream = match &params.after_account {
             Some(cursor) => {
@@ -408,42 +470,14 @@ impl ScyllaDb {
             }
         };
 
-        let mut accounts = Vec::new();
-        let mut skipped = 0;
+        let exclude_null = params.exclude_null.unwrap_or(false);
+        let offset = if params.after_account.is_some() { 0 } else { params.offset };
+        let page = collect_page(&mut rows_stream, params.limit, offset, None, |row: KvRow| {
+            if exclude_null && row.value == "null" { return None; }
+            Some(row.predecessor_id)
+        }).await;
 
-        while let Some(row_result) = rows_stream.next().await {
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in query_accounts"
-                    );
-                    continue;
-                }
-            };
-
-            if params.exclude_null.unwrap_or(false) && row.value == "null" {
-                continue;
-            }
-
-            // Apply offset only when not using cursor
-            if params.after_account.is_none() && skipped < params.offset {
-                skipped += 1;
-                continue;
-            }
-
-            accounts.push(row.predecessor_id);
-            if accounts.len() > params.limit {
-                break;
-            }
-        }
-
-        let has_more = accounts.len() > params.limit;
-        accounts.truncate(params.limit);
-
-        Ok((accounts, has_more))
+        Ok((page.items, page.has_more, page.dropped_rows))
     }
 
     /// Returns `(accounts, has_more, truncated)`.
@@ -455,7 +489,7 @@ impl ScyllaDb {
         limit: usize,
         offset: usize,
         after_account: Option<&str>,
-    ) -> anyhow::Result<(Vec<String>, bool, bool)> {
+    ) -> anyhow::Result<(Vec<String>, bool, bool, usize)> {
         let needs_dedup = key.is_none();
 
         let mut rows_stream = match key {
@@ -481,6 +515,7 @@ impl ScyllaDb {
         let mut accounts = Vec::new();
         let target_count = offset + limit + 1;
         let mut truncated = false;
+        let mut dropped_rows = 0usize;
 
         while let Some(row_result) = rows_stream.next().await {
             if needs_dedup && seen.len() >= MAX_DEDUP_SCAN {
@@ -491,6 +526,7 @@ impl ScyllaDb {
             let row = match row_result {
                 Ok(row) => row,
                 Err(e) => {
+                    dropped_rows += 1;
                     tracing::warn!(
                         target: "fastkv-server",
                         error = %e,
@@ -531,14 +567,14 @@ impl ScyllaDb {
         let mut result = result;
         result.truncate(limit);
 
-        Ok((result, has_more, truncated))
+        Ok((result, has_more, truncated, dropped_rows))
     }
 
-    /// Returns (entries, has_more).
+    /// Returns (entries, has_more, dropped_rows).
     pub async fn query_kv_with_pagination(
         &self,
         params: &QueryParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool)> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, usize)> {
         let mut rows_stream = match (&params.key_prefix, &params.after_key) {
             // Prefix + cursor: key > cursor AND key < prefix_end
             (Some(prefix), Some(cursor)) => {
@@ -595,43 +631,14 @@ impl ScyllaDb {
         };
 
         let exclude_null = params.exclude_null.unwrap_or(false);
-        let mut skipped = 0;
-        let mut entries = Vec::with_capacity(params.limit + 1);
-
-        while let Some(row_result) = rows_stream.next().await {
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in query_kv_with_pagination"
-                    );
-                    continue;
-                }
-            };
-
+        let offset = if params.after_key.is_some() { 0 } else { params.offset };
+        let page = collect_page(&mut rows_stream, params.limit, offset, None, |row: KvRow| {
             let entry = KvEntry::from(row);
+            if exclude_null && entry.value == "null" { return None; }
+            Some(entry)
+        }).await;
 
-            if exclude_null && entry.value == "null" {
-                continue;
-            }
-
-            // Apply offset only when not using cursor
-            if params.after_key.is_none() && skipped < params.offset {
-                skipped += 1;
-                continue;
-            }
-
-            entries.push(entry);
-            if entries.len() > params.limit {
-                break;
-            }
-        }
-
-        let has_more = entries.len() > params.limit;
-        entries.truncate(params.limit);
-        Ok((entries, has_more))
+        Ok((page.items, page.has_more, page.dropped_rows))
     }
 
     pub async fn get_kv_at_block(
@@ -652,20 +659,29 @@ impl ScyllaDb {
 
         // Multiple rows can exist per block_height (different order_id values);
         // .last() takes the highest order_id since clustering order is ASC.
-        let entry = result
-            .rows::<KvHistoryRow>()?
-            .filter_map(|r| r.ok())
-            .last()
-            .map(KvEntry::from);
+        let mut last_ok: Option<KvHistoryRow> = None;
+        for row_result in result.rows::<KvHistoryRow>()? {
+            match row_result {
+                Ok(row) => last_ok = Some(row),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "fastkv-server",
+                        error = %e,
+                        "Failed to deserialize row in get_kv_at_block"
+                    );
+                }
+            }
+        }
+        let entry = last_ok.map(KvEntry::from);
 
         Ok(entry)
     }
 
-    /// Returns (entries, has_more, truncated).
+    /// Returns (entries, has_more, truncated, dropped_rows).
     pub async fn get_kv_timeline(
         &self,
         params: &TimelineParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
@@ -675,61 +691,35 @@ impl ScyllaDb {
             .await?
             .rows_stream::<KvHistoryRow>()?;
 
-        let mut entries: Vec<KvEntry> = Vec::new();
-        let mut scanned = 0usize;
-        let mut truncated = false;
+        let from_block = params.from_block.map(|b| b.max(0) as u64);
+        let to_block = params.to_block.map(|b| b.max(0) as u64);
 
-        while let Some(row_result) = rows_stream.next().await {
-            scanned += 1;
-            if scanned > MAX_HISTORY_SCAN {
-                truncated = true;
-                break;
-            }
-
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(target: "fastkv-server", error = %e, "Failed to deserialize row in get_kv_timeline");
-                    continue;
-                }
-            };
-
+        let mut page = collect_page(&mut rows_stream, params.limit, 0, Some(MAX_HISTORY_SCAN), |row: KvHistoryRow| {
             let entry = KvEntry::from(row);
+            if let Some(fb) = from_block { if entry.block_height < fb { return None; } }
+            if let Some(tb) = to_block { if entry.block_height > tb { return None; } }
+            Some(entry)
+        }).await;
 
-            if let Some(from_block) = params.from_block {
-                if entry.block_height < (from_block.max(0) as u64) {
-                    continue;
-                }
-            }
-            if let Some(to_block) = params.to_block {
-                if entry.block_height > (to_block.max(0) as u64) {
-                    continue;
-                }
-            }
-
-            entries.push(entry);
-        }
-
-        entries.sort_by(|a, b| {
-            if params.order.to_lowercase() == "asc" {
+        // Post-sort (scan-cap mode collects all, caller sorts + slices)
+        let is_asc = params.order.eq_ignore_ascii_case("asc");
+        page.items.sort_by(|a, b| {
+            if is_asc {
                 a.block_height.cmp(&b.block_height)
             } else {
                 b.block_height.cmp(&a.block_height)
             }
         });
 
-        let result: Vec<KvEntry> = entries
-            .into_iter()
-            .skip(params.offset)
-            .collect();
+        let result: Vec<KvEntry> = page.items.into_iter().skip(params.offset).collect();
         let has_more = result.len() > params.limit;
         let mut result = result;
         result.truncate(params.limit);
 
-        Ok((result, has_more, truncated))
+        Ok((result, has_more, page.truncated, page.dropped_rows))
     }
 
-    /// Returns (entries, has_more).
+    /// Returns (entries, has_more, dropped_rows).
     pub async fn query_edges(
         &self,
         edge_type: &str,
@@ -737,7 +727,7 @@ impl ScyllaDb {
         limit: usize,
         offset: usize,
         after_source: Option<&str>,
-    ) -> anyhow::Result<(Vec<EdgeSourceEntry>, bool)> {
+    ) -> anyhow::Result<(Vec<EdgeSourceEntry>, bool, usize)> {
         let mut rows_stream = match after_source {
             Some(cursor) => {
                 self.scylla_session
@@ -753,40 +743,15 @@ impl ScyllaDb {
             }
         };
 
-        let mut skipped = 0;
-        let mut entries = Vec::with_capacity(limit + 1);
-
-        while let Some(row_result) = rows_stream.next().await {
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in query_edges"
-                    );
-                    continue;
-                }
-            };
-
-            if after_source.is_none() && skipped < offset {
-                skipped += 1;
-                continue;
-            }
-
-            entries.push(EdgeSourceEntry {
+        let effective_offset = if after_source.is_some() { 0 } else { offset };
+        let page = collect_page(&mut rows_stream, limit, effective_offset, None, |row: EdgeRow| {
+            Some(EdgeSourceEntry {
                 source: row.source,
                 block_height: bigint_to_u64(row.block_height),
-            });
+            })
+        }).await;
 
-            if entries.len() > limit {
-                break;
-            }
-        }
-
-        let has_more = entries.len() > limit;
-        entries.truncate(limit);
-        Ok((entries, has_more))
+        Ok((page.items, page.has_more, page.dropped_rows))
     }
 
     pub async fn count_edges(
@@ -810,11 +775,11 @@ impl ScyllaDb {
         Ok(count)
     }
 
-    /// Returns (entries, has_more, truncated).
+    /// Returns (entries, has_more, truncated, dropped_rows).
     pub async fn get_kv_history(
         &self,
         params: &HistoryParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
         let from_block = params.from_block.unwrap_or(0);
         let to_block = params.to_block.unwrap_or(i64::MAX);
 
@@ -827,44 +792,24 @@ impl ScyllaDb {
             .await?
             .rows_stream::<KvHistoryRow>()?;
 
-        let mut entries: Vec<KvEntry> = Vec::new();
-        let mut scanned = 0usize;
-        let mut truncated = false;
+        let mut page = collect_page(&mut rows_stream, params.limit, 0, Some(MAX_HISTORY_SCAN), |row: KvHistoryRow| {
+            Some(KvEntry::from(row))
+        }).await;
 
-        while let Some(row_result) = rows_stream.next().await {
-            scanned += 1;
-            if scanned > MAX_HISTORY_SCAN {
-                truncated = true;
-                break;
-            }
-
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in get_kv_history"
-                    );
-                    continue;
-                }
-            };
-
-            entries.push(KvEntry::from(row));
-        }
-
-        entries.sort_by(|a, b| {
-            if params.order.to_lowercase() == "asc" {
+        // Post-sort (scan-cap mode collects all, caller sorts + slices)
+        let is_asc = params.order.eq_ignore_ascii_case("asc");
+        page.items.sort_by(|a, b| {
+            if is_asc {
                 a.block_height.cmp(&b.block_height)
             } else {
                 b.block_height.cmp(&a.block_height)
             }
         });
 
-        let has_more = entries.len() > params.limit;
-        entries.truncate(params.limit);
+        let has_more = page.items.len() > params.limit;
+        page.items.truncate(params.limit);
 
-        Ok((entries, has_more, truncated))
+        Ok((page.items, has_more, page.truncated, page.dropped_rows))
     }
 
     pub async fn get_indexer_block_height(&self) -> anyhow::Result<Option<u64>> {
@@ -904,5 +849,86 @@ mod tests {
         assert!(validate_identifier("", "TEST").is_err());
         assert!(validate_identifier("table.name", "TEST").is_err());
         assert!(validate_identifier("name-with-dashes", "TEST").is_err());
+    }
+
+    fn make_err() -> NextRowError {
+        NextRowError::from(scylla::deserialize::DeserializationError::new(
+            std::io::Error::new(std::io::ErrorKind::Other, "test deser error"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_overfetch() {
+        let items: Vec<Result<i32, NextRowError>> = (1..=6).map(Ok).collect();
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 5, 0, None, Some).await;
+        assert_eq!(page.items.len(), 5);
+        assert!(page.has_more);
+        assert!(!page.truncated);
+        assert_eq!(page.dropped_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_under_limit() {
+        let items: Vec<Result<i32, NextRowError>> = (1..=3).map(Ok).collect();
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 5, 0, None, Some).await;
+        assert_eq!(page.items.len(), 3);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_with_offset() {
+        let items: Vec<Result<i32, NextRowError>> = (1..=10).map(Ok).collect();
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 5, 3, None, Some).await;
+        assert_eq!(page.items, vec![4, 5, 6, 7, 8]);
+        assert!(page.has_more); // item 9 caused overfetch
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_dropped_rows() {
+        let items: Vec<Result<i32, NextRowError>> = vec![
+            Ok(1), Err(make_err()), Ok(2), Err(make_err()), Ok(3),
+        ];
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 10, 0, None, Some).await;
+        assert_eq!(page.items, vec![1, 2, 3]);
+        assert_eq!(page.dropped_rows, 2);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_scan_cap() {
+        let items: Vec<Result<i32, NextRowError>> = (1..=20).map(Ok).collect();
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 100, 0, Some(10), Some).await;
+        assert!(page.truncated);
+        assert_eq!(page.items.len(), 10);
+        assert!(!page.has_more); // caller computes in scan-cap mode
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_filter_via_transform() {
+        // Only keep odd numbers; offset should count filtered items
+        let items: Vec<Result<i32, NextRowError>> = (1..=10).map(Ok).collect();
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 3, 1, None, |n| {
+            if n % 2 == 1 { Some(n) } else { None }
+        }).await;
+        // Odd items: 1, 3, 5, 7, 9. Skip 1 (offset), take 3+1: [3,5,7,9]
+        assert_eq!(page.items, vec![3, 5, 7]);
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn test_collect_page_empty_stream() {
+        let items: Vec<Result<i32, NextRowError>> = vec![];
+        let mut s = futures::stream::iter(items);
+        let page = collect_page(&mut s, 10, 0, None, Some).await;
+        assert!(page.items.is_empty());
+        assert!(!page.has_more);
+        assert!(!page.truncated);
+        assert_eq!(page.dropped_rows, 0);
     }
 }

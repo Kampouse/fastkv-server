@@ -40,6 +40,7 @@
 
 **Response headers (all endpoints):**
 - `X-Indexer-Block: <height>` — latest indexer block height, cached every 5s from `meta` table, added by middleware
+- `X-Dropped-Rows: <n>` — number of rows skipped due to deserialization errors (only present when > 0; social endpoints only — KV endpoints use `meta.dropped_rows` instead)
 
 ### Social Endpoints
 
@@ -86,9 +87,9 @@ No parameters.
 | `contractId` | string | yes | Contract account, max 256 chars |
 | `key` | string | yes | KV key, max 10,000 chars |
 | `fields` | string | no | Comma-separated field filter |
-| `decode` | bool | no | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` (default) or `"json"` (decoded) |
 
-Returns single `KvEntry` or `null`.
+Returns `DataResponse<KvEntry | null>`.
 
 ### GET /v1/kv/query
 
@@ -102,7 +103,8 @@ Returns single `KvEntry` or `null`.
 | `offset` | int | no | 0 | Max 100,000. Applied in-memory after fetch. |
 | `fields` | string | no | | Comma-separated field filter |
 | `format` | string | no | | `"tree"` for nested JSON (`TreeResponse`) |
-| `decode` | bool | no | false | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` | `"raw"` or `"json"` (decoded) |
+| `after_key` | string | no | | Cursor: return entries with key after this value (exclusive). Cannot combine with `offset > 0`. |
 
 Returns `PaginatedResponse<KvEntry>` or `TreeResponse` (if `format=tree`).
 
@@ -118,11 +120,10 @@ Returns `PaginatedResponse<KvEntry>` or `TreeResponse` (if `format=tree`).
 | `from_block` | int | no | | Min block height (CQL pushdown, must be >= 0) |
 | `to_block` | int | no | | Max block height (CQL pushdown, must be >= 0) |
 | `fields` | string | no | | Comma-separated field filter |
-| `decode` | bool | no | false | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` | `"raw"` or `"json"` (decoded) |
 
-Returns `PaginatedResponse<KvEntry>`. `truncated: true` if scan hit 10,000 rows.
-
-**Note:** No `offset` parameter. Use `from_block`/`to_block` for pagination.
+Returns `PaginatedResponse<KvEntry>`. `meta.truncated: true` if scan hit 10,000 rows.
+Paginate using `from_block`/`to_block` range narrowing + `limit`.
 
 ### GET /v1/kv/writers
 
@@ -135,9 +136,10 @@ Returns `PaginatedResponse<KvEntry>`. `truncated: true` if scan hit 10,000 rows.
 | `limit` | int | no | 100 | Range 1–1000 |
 | `offset` | int | no | 0 | Max 100,000. Applied in-memory. |
 | `fields` | string | no | | Comma-separated field filter |
-| `decode` | bool | no | false | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` | `"raw"` or `"json"` (decoded) |
+| `after_account` | string | no | | Cursor: return writers after this account (exclusive). Cannot combine with `offset > 0`. |
 
-Returns `PaginatedResponse<KvEntry>`. Deduplicates by `accountId` keeping newest entry (ORDER BY DESC). `truncated: true` if dedup scan hit 100,000 unique writers.
+Returns `PaginatedResponse<KvEntry>`. Deduplicates by `accountId` keeping newest entry (ORDER BY DESC). `meta.truncated: true` if dedup scan hit 100,000 unique writers.
 
 ### POST /v1/kv/batch
 
@@ -151,7 +153,7 @@ Request body:
 }
 ```
 
-Returns `{ "data": [BatchResultItem, ...] }`.
+Returns `DataResponse<BatchResultItem[]>`.
 
 ### GET /v1/kv/diff
 
@@ -163,9 +165,9 @@ Returns `{ "data": [BatchResultItem, ...] }`.
 | `block_height_a` | int | yes | First block height |
 | `block_height_b` | int | yes | Second block height |
 | `fields` | string | no | Comma-separated field filter |
-| `decode` | bool | no | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` or `"json"` (decoded) |
 
-Returns `{ "a": KvEntry | null, "b": KvEntry | null }`.
+Returns `DataResponse<DiffResponse>`.
 
 ### GET /v1/kv/timeline
 
@@ -179,9 +181,9 @@ Returns `{ "a": KvEntry | null, "b": KvEntry | null }`.
 | `from_block` | int | no | | Min block height (**in-memory filter, not CQL**) |
 | `to_block` | int | no | | Max block height (**in-memory filter, not CQL**) |
 | `fields` | string | no | | Comma-separated field filter |
-| `decode` | bool | no | false | When true, JSON-decode the `value` field |
+| `value_format` | string | no | `"raw"` | `"raw"` or `"json"` (decoded) |
 
-Returns `PaginatedResponse<KvEntry>`. `truncated: true` if scan hit 10,000 rows.
+Returns `PaginatedResponse<KvEntry>`. `meta.truncated: true` if scan hit 10,000 rows.
 
 ### GET /v1/kv/accounts
 
@@ -191,8 +193,9 @@ Returns `PaginatedResponse<KvEntry>`. `truncated: true` if scan hit 10,000 rows.
 | `key` | string | no | | Key filter. **Recommended for large contracts** — omitting triggers full partition scan + dedup. |
 | `limit` | int | no | 100 | Range 1–1000 |
 | `offset` | int | no | 0 | Max 100,000 |
+| `after_account` | string | no | | Cursor: return accounts after this value (exclusive). Cannot combine with `offset > 0`. |
 
-Returns `PaginatedResponse<String>` (list of account IDs). `truncated: true` if dedup scan hit 100,000.
+Returns `PaginatedResponse<String>` (list of account IDs). `meta.truncated: true` if dedup scan hit 100,000.
 
 ### GET /v1/kv/edges
 
@@ -213,7 +216,7 @@ Returns `PaginatedResponse<EdgeSourceEntry>`.
 | `edge_type` | string | yes | Edge type |
 | `target` | string | yes | Target account |
 
-Returns `{ "edge_type": "...", "target": "...", "count": 1234 }`.
+Returns `DataResponse<EdgesCountResponse>`.
 
 ### POST /v1/social/get
 
@@ -270,7 +273,7 @@ Returns nested JSON structure. Sets `X-Results-Truncated: true` header if trunca
 
 Returns `{ "entries": [IndexEntry, ...] }`.
 
-Uses a 30-second stream timeout. Aborts after 10 deserialization errors (`MAX_STREAM_ERRORS`).
+Uses a 30-second stream timeout. Aborts after 10 deserialization errors (`MAX_STREAM_ERRORS`). Sets `X-Dropped-Rows: <n>` header when deserialization errors occur.
 
 ### GET /v1/social/profile
 
@@ -289,12 +292,13 @@ Returns nested JSON tree of profile data (not wrapped in `PaginatedResponse`).
 | `limit` | int | no | 100 | Range 1–1000 |
 | `offset` | int | no | 0 | Max 100,000 |
 | `contract_id` | string | no | | Override default contract |
+| `after_account` | string | no | | Cursor: return accounts after this value (exclusive). Cannot combine with `offset > 0`. |
 
-Returns `{ "accounts": ["follower1.near", ...], "count": 5 }`.
+Returns `SocialFollowResponse` (`{ accounts, count, meta }`).
 
 ### GET /v1/social/following
 
-Same params and response shape as `/followers`.
+Same params and response shape as `/followers` (includes `after_account` cursor).
 
 ### GET /v1/social/feed/account
 
@@ -311,10 +315,62 @@ Returns `{ "posts": [IndexEntry, ...] }`. Uses history query with CQL block-heig
 
 ---
 
+## Pagination Contract
+
+All paginated endpoints return `PaginatedResponse<T>` with a `meta` object:
+
+```jsonc
+{
+  "data": [ ... ],
+  "meta": {
+    "has_more": true,
+    "truncated": true,       // omitted when false
+    "next_cursor": "last_key", // omitted when no items returned
+    "dropped_rows": 2        // omitted when zero — rows skipped due to deserialization errors
+  }
+}
+```
+
+**`meta.has_more`** — Authoritative for cursor+limit endpoints (query, writers, edges, followers, following) which use the limit+1 overfetch pattern. Best-effort for scan-limited endpoints (history, timeline, accounts) where a scan cap may prevent full enumeration.
+
+**`meta.next_cursor`** — Always set when items are returned, regardless of `has_more`. Use as the resume point for the next page via the corresponding `after_*` parameter.
+
+**`meta.truncated`** — True only when a scan/dedup cap was hit: 10,000 rows for history/timeline, 100,000 unique values for accounts. Omitted when false (`default: false` in OpenAPI schema). When true, `has_more` may be inaccurate — treat completion as unknown.
+
+**`meta.dropped_rows`** — Number of rows skipped due to deserialization errors. Omitted when zero. Nonzero means the results are complete for the requested page but some rows in the underlying data could not be read. This is a data-quality signal, not a pagination issue — clients do not need to retry. For social endpoints (which lack `meta`), the same information is conveyed via the `X-Dropped-Rows` response header.
+
+**Cursor/offset exclusivity** — All endpoints reject `after_*` cursor combined with `offset > 0` (HTTP 400).
+
+**Client rule** — Stop paginating when `meta.has_more == false` and `meta.truncated != true`. If `truncated` is true, the client may continue via `next_cursor` but should treat the dataset as potentially incomplete.
+
+**History/timeline pagination** — These endpoints have no `after_*` cursor. Paginate by narrowing the block range:
+- Descending: set `to_block` to `last_returned_block_height - 1` for the next page
+- Ascending: set `from_block` to `last_returned_block_height + 1` for the next page
+
+---
+
 ## TypeScript Interfaces
 
 ```typescript
-// ── Response Types ──────────────────────────────────────────────
+// ── Response Envelope ───────────────────────────────────────────
+
+interface PaginationMeta {
+  has_more: boolean;
+  truncated?: boolean;      // omitted when false (default: false)
+  next_cursor?: string;     // omitted when no items returned
+  dropped_rows?: number;    // omitted when zero — rows skipped due to deserialization errors
+}
+
+interface PaginatedResponse<T> {
+  data: T[];
+  meta: PaginationMeta;
+}
+
+interface DataResponse<T> {
+  data: T;
+}
+
+// ── Domain Types ────────────────────────────────────────────────
 
 interface KvEntry {
   accountId: string;
@@ -325,12 +381,7 @@ interface KvEntry {
   block_timestamp: number;
   receipt_id: string;
   tx_hash: string;
-}
-
-interface PaginatedResponse<T> {
-  data: T[];
-  has_more: boolean;
-  truncated?: boolean; // omitted when false
+  is_deleted?: boolean;  // omitted when false
 }
 
 interface HealthResponse {
@@ -383,6 +434,7 @@ interface IndexResponse {
 interface SocialFollowResponse {
   accounts: string[];
   count: number;
+  meta: PaginationMeta;
 }
 
 interface SocialFeedResponse {
@@ -396,7 +448,7 @@ interface GetParams {
   contractId: string;
   key: string;
   fields?: string;
-  decode?: boolean;
+  value_format?: "raw" | "json";
 }
 
 interface QueryParams {
@@ -404,11 +456,12 @@ interface QueryParams {
   contractId: string;
   key_prefix?: string;
   exclude_null?: boolean;
-  limit?: number;   // default 100, max 1000
+  limit?: number;    // default 100, max 1000
   offset?: number;   // default 0, max 100_000
   fields?: string;
   format?: "tree";
-  decode?: boolean;
+  value_format?: "raw" | "json";
+  after_key?: string; // cursor, cannot combine with offset > 0
 }
 
 interface HistoryParams {
@@ -420,8 +473,7 @@ interface HistoryParams {
   from_block?: number;
   to_block?: number;
   fields?: string;
-  decode?: boolean;
-  // NOTE: no offset param
+  value_format?: "raw" | "json";
 }
 
 interface WritersParams {
@@ -432,7 +484,8 @@ interface WritersParams {
   limit?: number;
   offset?: number;
   fields?: string;
-  decode?: boolean;
+  value_format?: "raw" | "json";
+  after_account?: string; // cursor, cannot combine with offset > 0
 }
 
 interface AccountsQueryParams {
@@ -440,6 +493,7 @@ interface AccountsQueryParams {
   key?: string;
   limit?: number;
   offset?: number;
+  after_account?: string; // cursor, cannot combine with offset > 0
 }
 
 interface DiffParams {
@@ -449,7 +503,7 @@ interface DiffParams {
   block_height_a: number;
   block_height_b: number;
   fields?: string;
-  decode?: boolean;
+  value_format?: "raw" | "json";
 }
 
 interface TimelineParams {
@@ -461,7 +515,7 @@ interface TimelineParams {
   from_block?: number;
   to_block?: number;
   fields?: string;
-  decode?: boolean;
+  value_format?: "raw" | "json";
 }
 
 interface EdgesParams {
@@ -469,7 +523,7 @@ interface EdgesParams {
   target: string;
   limit?: number;
   offset?: number;
-  after_source?: string; // cursor, cannot combine with offset
+  after_source?: string; // cursor, cannot combine with offset > 0
 }
 
 interface EdgesCountParams {
@@ -485,7 +539,7 @@ interface BatchQuery {
 
 interface SocialGetBody {
   keys: string[]; // max 100 patterns
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
   options?: {
     with_block_height?: boolean;
     return_deleted?: boolean;
@@ -494,7 +548,7 @@ interface SocialGetBody {
 
 interface SocialKeysBody {
   keys: string[];
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
   options?: {
     return_type?: "True" | "BlockHeight";
     return_deleted?: boolean;
@@ -509,28 +563,29 @@ interface SocialIndexParams {
   limit?: number;
   from?: number; // block height cursor
   account_id?: string; // also accepts accountId
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
 }
 
 interface SocialProfileParams {
   account_id: string; // also accepts accountId
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
 }
 
 interface SocialFollowParams {
-  account_id: string;
+  account_id: string; // also accepts accountId
   limit?: number;
   offset?: number;
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
+  after_account?: string; // cursor, cannot combine with offset > 0
 }
 
 interface SocialAccountFeedParams {
-  account_id: string;
+  account_id: string; // also accepts accountId
   order?: "asc" | "desc";
   limit?: number;
   from?: number;
   include_replies?: boolean;
-  contract_id?: string;
+  contract_id?: string; // also accepts contractId
 }
 ```
 
@@ -639,6 +694,8 @@ interface SocialAccountFeedParams {
 - **`PaginatedResponse<T>`**: `truncated` field omitted when false (`skip_serializing_if`)
 - **`X-Results-Truncated` header**: Set by `/social/get` and `/social/keys`, exposed via CORS
 - **`X-Indexer-Block` header**: Added to every response by middleware, cached from `meta` table every 5s, exposed via CORS
+- **`meta.dropped_rows`**: Omitted when zero, present as integer when deserialization errors occur on KV endpoints
+- **`X-Dropped-Rows` header**: Set on social endpoints when deserialization errors occur (same semantics, header form)
 - **ORDER BY DESC dedup**: First occurrence kept = newest entry (writers, accounts)
 - **`MAX_STREAM_ERRORS = 10`**: Defined in `models.rs:15`, used in `social_handlers.rs:165`
 - **Social handler validation parity**: `validate_offset()` applied to followers/following

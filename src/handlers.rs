@@ -7,12 +7,12 @@ use tokio::sync::RwLockReadGuard;
 
 use std::collections::HashSet;
 
-pub(crate) async fn require_db(state: &AppState) -> Result<RwLockReadGuard<'_, Option<ScyllaDb>>, ApiError> {
+pub(crate) async fn require_db(state: &AppState) -> Result<RwLockReadGuard<'_, ScyllaDb>, ApiError> {
     let guard = state.scylladb.read().await;
     if guard.is_none() {
         return Err(ApiError::DatabaseUnavailable);
     }
-    Ok(guard)
+    Ok(RwLockReadGuard::map(guard, |opt| opt.as_ref().unwrap()))
 }
 
 /// Attempt to JSON-decode the `"value"` field in a serialized entry.
@@ -83,6 +83,50 @@ pub(crate) fn validate_offset(offset: usize) -> Result<(), ApiError> {
         return Err(ApiError::InvalidParameter(
             format!("offset cannot exceed {}", MAX_OFFSET),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cursor_or_offset(
+    cursor: Option<&str>,
+    cursor_name: &str,
+    offset: usize,
+    validate_cursor_fn: impl FnOnce(&str, &str) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    if let Some(c) = cursor {
+        validate_cursor_fn(c, cursor_name)?;
+        if offset > 0 {
+            return Err(ApiError::InvalidParameter(
+                format!("cannot use both '{}' cursor and 'offset'", cursor_name),
+            ));
+        }
+    } else {
+        validate_offset(offset)?;
+    }
+    Ok(())
+}
+
+fn validate_order(order: &str) -> Result<(), ApiError> {
+    if !order.eq_ignore_ascii_case("asc") && !order.eq_ignore_ascii_case("desc") {
+        return Err(ApiError::InvalidParameter(
+            "order must be 'asc' or 'desc'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_block_range(from_block: Option<i64>, to_block: Option<i64>) -> Result<(), ApiError> {
+    if from_block.is_some_and(|v| v < 0) || to_block.is_some_and(|v| v < 0) {
+        return Err(ApiError::InvalidParameter(
+            "block heights cannot be negative".to_string(),
+        ));
+    }
+    if let (Some(from), Some(to)) = (from_block, to_block) {
+        if from > to {
+            return Err(ApiError::InvalidParameter(
+                "from_block must be less than or equal to to_block".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -166,13 +210,12 @@ pub async fn get_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entry = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .get_kv(&query.predecessor_id, &query.current_account_id, &query.key)
+    let entry = db.get_kv(&query.predecessor_id, &query.current_account_id, &query.key)
         .await?;
 
     // Apply field selection and optional value decoding
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     match entry {
         Some(entry) => {
             if fields.is_some() || decode {
@@ -210,17 +253,7 @@ pub async fn query_kv_handler(
     validate_limit(query.limit)?;
     validate_prefix(&query.key_prefix)?;
 
-    // Validate cursor vs offset conflict
-    if let Some(ref cursor) = query.after_key {
-        validate_key(cursor, "after_key", MAX_KEY_LENGTH)?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_key' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_key.as_deref(), "after_key", query.offset, |c, n| validate_key(c, n, MAX_KEY_LENGTH))?;
 
     if let Some(ref fmt) = query.format {
         if fmt != "tree" {
@@ -242,8 +275,7 @@ pub async fn query_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .query_kv_with_pagination(&query)
+    let (entries, has_more, dropped) = db.query_kv_with_pagination(&query)
         .await?;
 
     if query.format.as_deref() == Some("tree") {
@@ -256,13 +288,16 @@ pub async fn query_kv_handler(
     }
 
     let next_cursor = entries.last().map(|e| e.key.clone());
-    let meta = PaginationMeta { has_more, truncated: false, next_cursor };
+    let meta = PaginationMeta { has_more, truncated: false, next_cursor, dropped_rows: dropped_to_option(dropped) };
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
 /// Get historical versions of a KV entry
+///
+/// Scans up to 10,000 rows; `meta.truncated` is true if the cap was hit.
+/// Paginate using `from_block`/`to_block` range narrowing + `limit`.
 #[utoipa::path(
     get,
     path = "/v1/kv/history",
@@ -283,25 +318,8 @@ pub async fn history_kv_handler(
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     validate_limit(query.limit)?;
 
-    let order_lower = query.order.to_lowercase();
-    if order_lower != "asc" && order_lower != "desc" {
-        return Err(ApiError::InvalidParameter(
-            "order must be 'asc' or 'desc'".to_string(),
-        ));
-    }
-
-    if query.from_block.is_some_and(|v| v < 0) || query.to_block.is_some_and(|v| v < 0) {
-        return Err(ApiError::InvalidParameter(
-            "block heights cannot be negative".to_string(),
-        ));
-    }
-    if let (Some(from), Some(to)) = (query.from_block, query.to_block) {
-        if from > to {
-            return Err(ApiError::InvalidParameter(
-                "from_block must be less than or equal to to_block".to_string(),
-            ));
-        }
-    }
+    validate_order(&query.order)?;
+    validate_block_range(query.from_block, query.to_block)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -316,14 +334,13 @@ pub async fn history_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .get_kv_history(&query)
+    let (entries, has_more, truncated, dropped) = db.get_kv_history(&query)
         .await?;
 
     let next_cursor = entries.last().map(|e| e.block_height.to_string());
-    let meta = PaginationMeta { has_more, truncated, next_cursor };
+    let meta = PaginationMeta { has_more, truncated, next_cursor, dropped_rows: dropped_to_option(dropped) };
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
@@ -350,17 +367,7 @@ pub async fn writers_handler(
         validate_account_id(pred, "accountId")?;
     }
 
-    // Validate cursor vs offset conflict
-    if let Some(ref cursor) = query.after_account {
-        validate_account_id(cursor, "after_account")?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_account' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_account.as_deref(), "after_account", query.offset, validate_account_id)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -374,14 +381,13 @@ pub async fn writers_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .query_writers(&query)
+    let (entries, has_more, truncated, dropped) = db.query_writers(&query)
         .await?;
 
     let next_cursor = entries.last().map(|e| e.predecessor_id.clone());
-    let meta = PaginationMeta { has_more, truncated, next_cursor };
+    let meta = PaginationMeta { has_more, truncated, next_cursor, dropped_rows: dropped_to_option(dropped) };
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
@@ -413,17 +419,7 @@ pub async fn accounts_handler(
         validate_key(key, "key", MAX_KEY_LENGTH)?;
     }
 
-    // Validate cursor vs offset conflict
-    if let Some(ref cursor) = query.after_account {
-        validate_account_id(cursor, "after_account")?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_account' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_account.as_deref(), "after_account", query.offset, validate_account_id)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -436,8 +432,7 @@ pub async fn accounts_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (accounts, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .query_accounts_by_contract(
+    let (accounts, has_more, truncated, dropped) = db.query_accounts_by_contract(
             &query.contract_id,
             query.key.as_deref(),
             query.limit,
@@ -451,6 +446,7 @@ pub async fn accounts_handler(
         has_more,
         truncated,
         next_cursor,
+        dropped_rows: dropped_to_option(dropped),
     };
 
     Ok(HttpResponse::Ok().json(PaginatedResponse {
@@ -490,18 +486,17 @@ pub async fn diff_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
     let (a, b) = futures::future::try_join(
-        scylladb.get_kv_at_block(
+        db.get_kv_at_block(
             &query.predecessor_id, &query.current_account_id, &query.key, query.block_height_a,
         ),
-        scylladb.get_kv_at_block(
+        db.get_kv_at_block(
             &query.predecessor_id, &query.current_account_id, &query.key, query.block_height_b,
         ),
     ).await?;
 
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     if fields.is_some() || decode {
         let mut a_json = a.as_ref().map(|e| e.to_json_with_fields(&fields));
         let mut b_json = b.as_ref().map(|e| e.to_json_with_fields(&fields));
@@ -516,6 +511,9 @@ pub async fn diff_kv_handler(
 }
 
 /// All writes by one account across all keys, ordered by block_height
+///
+/// Scans up to 10,000 rows; `meta.truncated` is true if the cap was hit.
+/// `from_block`/`to_block` are filtered in-memory (not CQL pushdown).
 #[utoipa::path(
     get,
     path = "/v1/kv/timeline",
@@ -536,25 +534,8 @@ pub async fn timeline_kv_handler(
     validate_limit(query.limit)?;
     validate_offset(query.offset)?;
 
-    let order_lower = query.order.to_lowercase();
-    if order_lower != "asc" && order_lower != "desc" {
-        return Err(ApiError::InvalidParameter(
-            "order must be 'asc' or 'desc'".to_string(),
-        ));
-    }
-
-    if query.from_block.is_some_and(|v| v < 0) || query.to_block.is_some_and(|v| v < 0) {
-        return Err(ApiError::InvalidParameter(
-            "block heights cannot be negative".to_string(),
-        ));
-    }
-    if let (Some(from), Some(to)) = (query.from_block, query.to_block) {
-        if from > to {
-            return Err(ApiError::InvalidParameter(
-                "from_block must be less than or equal to to_block".to_string(),
-            ));
-        }
-    }
+    validate_order(&query.order)?;
+    validate_block_range(query.from_block, query.to_block)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -569,14 +550,13 @@ pub async fn timeline_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .get_kv_timeline(&query)
+    let (entries, has_more, truncated, dropped) = db.get_kv_timeline(&query)
         .await?;
 
     let next_cursor = entries.last().map(|e| e.block_height.to_string());
-    let meta = PaginationMeta { has_more, truncated, next_cursor };
+    let meta = PaginationMeta { has_more, truncated, next_cursor, dropped_rows: dropped_to_option(dropped) };
     let fields = parse_field_set(&query.fields);
-    let decode = should_decode(&query.value_format, &query.decode)?;
+    let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
@@ -609,6 +589,11 @@ pub async fn batch_kv_handler(
         ));
     }
     for key in &body.keys {
+        if key.is_empty() {
+            return Err(ApiError::InvalidParameter(
+                "key in batch cannot be empty".to_string(),
+            ));
+        }
         if key.len() > MAX_BATCH_KEY_LENGTH {
             return Err(ApiError::InvalidParameter(
                 format!("each key cannot exceed {} characters", MAX_BATCH_KEY_LENGTH),
@@ -691,16 +676,7 @@ pub async fn edges_handler(
     validate_account_id(&query.target, "target")?;
     validate_limit(query.limit)?;
 
-    if let Some(ref cursor) = query.after_source {
-        validate_account_id(cursor, "after_source")?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_source' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_source.as_deref(), "after_source", query.offset, validate_account_id)?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -713,8 +689,7 @@ pub async fn edges_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (sources, has_more) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .query_edges(
+    let (sources, has_more, dropped) = db.query_edges(
             &query.edge_type,
             &query.target,
             query.limit,
@@ -728,6 +703,7 @@ pub async fn edges_handler(
         has_more,
         truncated: false,
         next_cursor,
+        dropped_rows: dropped_to_option(dropped),
     };
 
     Ok(HttpResponse::Ok().json(PaginatedResponse {
@@ -764,8 +740,7 @@ pub async fn edges_count_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let count = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .count_edges(&query.edge_type, &query.target)
+    let count = db.count_edges(&query.edge_type, &query.target)
         .await?;
 
     Ok(HttpResponse::Ok().json(DataResponse {

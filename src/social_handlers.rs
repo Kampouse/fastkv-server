@@ -1,7 +1,7 @@
 use actix_web::{get, post, web, HttpResponse};
 use futures::stream::StreamExt;
 
-use crate::handlers::{require_db, validate_account_id, validate_offset};
+use crate::handlers::{require_db, validate_account_id, validate_cursor_or_offset};
 use crate::models::*;
 use crate::tree::build_tree;
 use crate::AppState;
@@ -133,12 +133,12 @@ struct IndexQuery<'a> {
     account_id: Option<&'a str>,
 }
 
-async fn query_index(q: IndexQuery<'_>) -> Result<Vec<IndexEntry>, ApiError> {
+/// Returns (entries, dropped_rows).
+async fn query_index(q: IndexQuery<'_>) -> Result<(Vec<IndexEntry>, usize), ApiError> {
     let IndexQuery { app_state, contract_id, action, key, order, limit, from, account_id } = q;
     let index_key = format!("index/{}/{}", action, key);
 
-    let db = require_db(app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(app_state).await?;
     let mut rows_stream = scylladb
         .scylla_session
         .execute_iter(
@@ -224,7 +224,7 @@ async fn query_index(q: IndexQuery<'_>) -> Result<Vec<IndexEntry>, ApiError> {
     }
 
     entries.truncate(limit);
-    Ok(entries)
+    Ok((entries, error_count))
 }
 
 // ===== Handlers =====
@@ -264,8 +264,7 @@ pub async fn social_get_handler(
 
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/get");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
 
@@ -311,12 +310,14 @@ pub async fn social_get_handler(
                     offset: 0,
                     fields: None,
                     format: None,
-                    decode: None,
                     value_format: None,
                     after_key: None,
                 };
 
-                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, _has_more, dropped) = scylladb.query_kv_with_pagination(&query).await?;
+                if dropped > 0 {
+                    tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social get (recursive wildcard)");
+                }
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -348,12 +349,14 @@ pub async fn social_get_handler(
                     offset: 0,
                     fields: None,
                     format: None,
-                    decode: None,
                     value_format: None,
                     after_key: None,
                 };
 
-                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, _has_more, dropped) = scylladb.query_kv_with_pagination(&query).await?;
+                if dropped > 0 {
+                    tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social get (single wildcard)");
+                }
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -386,11 +389,13 @@ pub async fn social_get_handler(
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
-                    decode: None,
                     value_format: None,
                     after_account: None,
                 };
-                let entries = scylladb.query_writers(&by_key_params).await?.0;
+                let (entries, _has_more, _truncated, dropped) = scylladb.query_writers(&by_key_params).await?;
+                if dropped > 0 {
+                    tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social get (wildcard account)");
+                }
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -455,8 +460,7 @@ pub async fn social_keys_handler(
 
     tracing::info!(target: PROJECT_ID, key_count = body.keys.len(), contract_id = %contract, "POST /v1/social/keys");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     let mut result_root = serde_json::Map::new();
     let mut truncated = false;
 
@@ -501,12 +505,14 @@ pub async fn social_keys_handler(
                     offset: 0,
                     fields: None,
                     format: None,
-                    decode: None,
                     value_format: None,
                     after_key: None,
                 };
 
-                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, _has_more, dropped) = scylladb.query_kv_with_pagination(&query).await?;
+                if dropped > 0 {
+                    tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social keys");
+                }
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -607,11 +613,13 @@ pub async fn social_keys_handler(
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
-                    decode: None,
                     value_format: None,
                     after_account: None,
                 };
-                let entries = scylladb.query_writers(&by_key_params).await?.0;
+                let (entries, _has_more, _truncated, dropped) = scylladb.query_writers(&by_key_params).await?;
+                if dropped > 0 {
+                    tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social keys (wildcard account)");
+                }
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -672,7 +680,7 @@ pub async fn social_index_handler(
 
     tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, contract_id = %contract, "GET /v1/social/index");
 
-    let entries = query_index(IndexQuery {
+    let (entries, dropped) = query_index(IndexQuery {
         app_state: &app_state,
         contract_id: contract,
         action: &query.action,
@@ -683,7 +691,11 @@ pub async fn social_index_handler(
         account_id: query.account_id.as_deref(),
     }).await?;
 
-    Ok(HttpResponse::Ok().json(IndexResponse { entries }))
+    let mut response = HttpResponse::Ok();
+    if dropped > 0 {
+        response.insert_header(("X-Dropped-Rows", dropped.to_string()));
+    }
+    Ok(response.json(IndexResponse { entries }))
 }
 
 /// Get a user's profile from SocialDB
@@ -707,8 +719,7 @@ pub async fn social_profile_handler(
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/profile");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
         current_account_id: contract.to_string(),
@@ -718,12 +729,14 @@ pub async fn social_profile_handler(
         offset: 0,
         fields: None,
         format: None,
-        decode: None,
         value_format: None,
         after_key: None,
     };
 
-    let (entries, ..) = scylladb.query_kv_with_pagination(&params).await?;
+    let (entries, _has_more, dropped) = scylladb.query_kv_with_pagination(&params).await?;
+    if dropped > 0 {
+        tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social profile");
+    }
 
     let items: Vec<(String, String)> = entries.into_iter()
         .map(|e| {
@@ -756,22 +769,11 @@ pub async fn social_followers_handler(
     validate_limit(query.limit)?;
     let contract = resolve_contract(&query.contract_id)?;
 
-    // Validate cursor vs offset conflict
-    if let Some(ref cursor) = query.after_account {
-        validate_account_id(cursor, "after_account")?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_account' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_account.as_deref(), "after_account", query.offset, validate_account_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/followers");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     // Followers are accounts that wrote key "graph/follow/{accountId}" to the contract
     let follow_key = format!("graph/follow/{}", query.account_id);
 
@@ -784,7 +786,7 @@ pub async fn social_followers_handler(
         after_account: query.after_account.clone(),
     };
 
-    let (accounts, has_more) = scylladb.query_accounts(&params).await?;
+    let (accounts, has_more, dropped) = scylladb.query_accounts(&params).await?;
     let count = accounts.len();
     let next_cursor = accounts.last().cloned();
 
@@ -795,6 +797,7 @@ pub async fn social_followers_handler(
             has_more,
             truncated: false,
             next_cursor,
+            dropped_rows: dropped_to_option(dropped),
         },
     }))
 }
@@ -819,22 +822,11 @@ pub async fn social_following_handler(
     validate_limit(query.limit)?;
     let contract = resolve_contract(&query.contract_id)?;
 
-    // Validate cursor vs offset conflict
-    if let Some(ref cursor) = query.after_account {
-        validate_account_id(cursor, "after_account")?;
-        if query.offset > 0 {
-            return Err(ApiError::InvalidParameter(
-                "cannot use both 'after_account' cursor and 'offset'".to_string(),
-            ));
-        }
-    } else {
-        validate_offset(query.offset)?;
-    }
+    validate_cursor_or_offset(query.after_account.as_deref(), "after_account", query.offset, validate_account_id)?;
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/following");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     // Following are keys under "graph/follow/" written by this account to the contract
     let params = QueryParams {
         predecessor_id: query.account_id.clone(),
@@ -845,12 +837,11 @@ pub async fn social_following_handler(
         offset: query.offset,
         fields: None,
         format: None,
-        decode: None,
         value_format: None,
         after_key: query.after_account.as_ref().map(|a| format!("graph/follow/{}", a)),
     };
 
-    let (entries, has_more) = scylladb.query_kv_with_pagination(&params).await?;
+    let (entries, has_more, dropped) = scylladb.query_kv_with_pagination(&params).await?;
 
     let accounts: Vec<String> = entries.into_iter()
         .filter_map(|e| e.key.strip_prefix("graph/follow/").map(|s| s.to_string()))
@@ -865,6 +856,7 @@ pub async fn social_following_handler(
             has_more,
             truncated: false,
             next_cursor,
+            dropped_rows: dropped_to_option(dropped),
         },
     }))
 }
@@ -891,8 +883,7 @@ pub async fn social_account_feed_handler(
 
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, "GET /v1/social/feed/account");
 
-    let db = require_db(&app_state).await?;
-    let scylladb = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?;
+    let scylladb = require_db(&app_state).await?;
     let from_block = query.from.map(|f| i64::try_from(f).unwrap_or(i64::MAX));
     let include_replies = query.include_replies.unwrap_or(false);
 
@@ -912,7 +903,6 @@ pub async fn social_account_feed_handler(
         from_block,
         to_block: None,
         fields: None,
-        decode: None,
         value_format: None,
     };
 
@@ -925,15 +915,18 @@ pub async fn social_account_feed_handler(
         from_block,
         to_block: None,
         fields: None,
-        decode: None,
         value_format: None,
     };
 
     let posts: Vec<IndexEntry> = if include_replies {
-        let ((entries, ..), (comment_entries, ..)) = futures::future::try_join(
+        let ((entries, _hm1, _tr1, dropped1), (comment_entries, _hm2, _tr2, dropped2)) = futures::future::try_join(
             scylladb.get_kv_history(&history_params),
             scylladb.get_kv_history(&comment_params),
         ).await?;
+        let total_dropped = dropped1 + dropped2;
+        if total_dropped > 0 {
+            tracing::warn!(target: PROJECT_ID, dropped = total_dropped, "Dropped rows in social feed");
+        }
 
         let mut combined: Vec<IndexEntry> = entries.into_iter()
             .chain(comment_entries.into_iter())
@@ -949,7 +942,10 @@ pub async fn social_account_feed_handler(
         combined.truncate(query.limit);
         combined
     } else {
-        let (entries, ..) = scylladb.get_kv_history(&history_params).await?;
+        let (entries, _has_more, _truncated, dropped) = scylladb.get_kv_history(&history_params).await?;
+        if dropped > 0 {
+            tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social feed");
+        }
         entries.into_iter().map(to_index_entry).collect()
     };
 

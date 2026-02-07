@@ -217,7 +217,7 @@ async fn main() -> std::io::Result<()> {
                 header::AUTHORIZATION,
                 header::ACCEPT,
             ])
-            .expose_headers(vec!["X-Results-Truncated", "X-Indexer-Block"])
+            .expose_headers(vec!["X-Results-Truncated", "X-Indexer-Block", "X-Dropped-Rows"])
             .max_age(3600);
 
         App::new()

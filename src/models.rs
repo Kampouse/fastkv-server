@@ -15,6 +15,7 @@ pub const MAX_SOCIAL_KEYS: usize = 100;
 pub const MAX_STREAM_ERRORS: usize = 10;
 pub const MAX_HISTORY_SCAN: usize = 10_000;
 pub const MAX_DEDUP_SCAN: usize = 100_000;
+pub const MAX_EDGE_TYPE_LENGTH: usize = 256;
 pub const PROJECT_ID: &str = "fastkv-server";
 
 // Raw row from ScyllaDB s_kv_last (matches table schema exactly)
@@ -164,9 +165,13 @@ impl From<KvHistoryRow> for KvEntry {
 pub struct PaginationMeta {
     pub has_more: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(default = false)]
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Number of rows skipped due to deserialization errors. Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_rows: Option<u32>,
 }
 
 // Standardized paginated response for all list endpoints
@@ -204,10 +209,7 @@ pub struct GetParams {
     pub key: String,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
 }
@@ -222,13 +224,16 @@ pub fn parse_field_set(fields: &Option<String>) -> Option<std::collections::Hash
     })
 }
 
-/// Resolve whether to decode values based on `value_format` and deprecated `decode` param.
-/// `value_format` takes precedence when set.
-pub fn should_decode(value_format: &Option<String>, decode: &Option<bool>) -> Result<bool, ApiError> {
+/// Convert a dropped-row count to `Option<u32>`, returning `None` for zero.
+pub(crate) fn dropped_to_option(n: usize) -> Option<u32> {
+    if n > 0 { Some(n.min(u32::MAX as usize) as u32) } else { None }
+}
+
+/// Resolve whether to decode values based on `value_format`.
+pub fn should_decode(value_format: &Option<String>) -> Result<bool, ApiError> {
     match value_format.as_deref() {
         Some("json") => Ok(true),
-        Some("raw") => Ok(false),
-        None => Ok(decode.unwrap_or(false)),
+        Some("raw") | None => Ok(false),
         Some(other) => Err(ApiError::InvalidParameter(
             format!("value_format must be 'json' or 'raw', got '{}'", other),
         )),
@@ -258,12 +263,10 @@ pub struct QueryParams {
     pub offset: usize,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
+    /// Response format. Use `"tree"` for nested JSON; omit for paginated list.
     #[serde(default)]
-    pub format: Option<String>, // "tree" for nested JSON response
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    pub format: Option<String>,
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
     /// Cursor: return entries with key alphabetically after this value (exclusive).
@@ -291,10 +294,7 @@ pub struct WritersParams {
     pub offset: usize,
     #[serde(default)]
     pub fields: Option<String>,
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
     /// Cursor: return writers with account ID alphabetically after this value (exclusive).
@@ -326,10 +326,7 @@ pub struct HistoryParams {
     pub to_block: Option<i64>,
     #[serde(default)]
     pub fields: Option<String>, // Comma-separated field names
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
 }
@@ -391,10 +388,7 @@ pub struct DiffParams {
     pub block_height_b: i64,
     #[serde(default)]
     pub fields: Option<String>,
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
 }
@@ -424,10 +418,7 @@ pub struct TimelineParams {
     pub to_block: Option<i64>,
     #[serde(default)]
     pub fields: Option<String>,
-    /// When true, JSON-decode the value field instead of returning the raw encoded string.
-    #[serde(default)]
-    pub decode: Option<bool>,
-    /// Value format: "raw" (default) or "json" (decoded). Supersedes `decode` when set.
+    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
 }
@@ -458,6 +449,7 @@ pub struct BatchResultItem {
 pub struct SocialGetBody {
     pub keys: Vec<String>,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
     #[serde(default)]
     pub options: Option<SocialGetOptions>,
@@ -476,6 +468,7 @@ pub struct SocialGetOptions {
 pub struct SocialKeysBody {
     pub keys: Vec<String>,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
     #[serde(default)]
     pub options: Option<SocialKeysOptions>,
@@ -506,6 +499,7 @@ pub struct SocialIndexParams {
     #[serde(alias = "accountId")]
     pub account_id: Option<String>,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
 }
 
@@ -515,6 +509,7 @@ pub struct SocialProfileParams {
     #[serde(alias = "accountId")]
     pub account_id: String,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
 }
 
@@ -528,6 +523,7 @@ pub struct SocialFollowParams {
     #[serde(default)]
     pub offset: usize,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
     /// Cursor: return accounts alphabetically after this value (exclusive).
     /// Cannot be combined with offset > 0.
@@ -549,6 +545,7 @@ pub struct SocialAccountFeedParams {
     #[serde(default)]
     pub include_replies: Option<bool>,
     #[serde(default)]
+    #[serde(alias = "contractId")]
     pub contract_id: Option<String>,
 }
 
@@ -628,8 +625,6 @@ impl From<anyhow::Error> for ApiError {
 
 // ===== Edges API types =====
 
-pub const MAX_EDGE_TYPE_LENGTH: usize = 256;
-
 // Raw row from ScyllaDB kv_edges table
 #[derive(DeserializeRow, Debug, Clone)]
 pub struct EdgeRow {
@@ -646,7 +641,8 @@ pub struct EdgesParams {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    /// Cursor: return sources alphabetically after this value (exclusive). When set, offset is ignored.
+    /// Cursor: return sources alphabetically after this value (exclusive).
+    /// Cannot be combined with offset > 0.
     #[serde(default)]
     pub after_source: Option<String>,
 }
@@ -750,16 +746,11 @@ mod tests {
 
     #[test]
     fn test_should_decode() {
-        // value_format takes precedence
-        assert!(should_decode(&Some("json".to_string()), &None).unwrap());
-        assert!(should_decode(&Some("json".to_string()), &Some(false)).unwrap());
-        assert!(!should_decode(&Some("raw".to_string()), &Some(true)).unwrap());
-        // Falls back to decode when value_format is None
-        assert!(should_decode(&None, &Some(true)).unwrap());
-        assert!(!should_decode(&None, &Some(false)).unwrap());
-        assert!(!should_decode(&None, &None).unwrap());
+        assert!(should_decode(&Some("json".to_string())).unwrap());
+        assert!(!should_decode(&Some("raw".to_string())).unwrap());
+        assert!(!should_decode(&None).unwrap());
         // Invalid value_format
-        assert!(should_decode(&Some("invalid".to_string()), &None).is_err());
+        assert!(should_decode(&Some("invalid".to_string())).is_err());
     }
 
     #[test]
@@ -781,16 +772,19 @@ mod tests {
             has_more: true,
             truncated: false,
             next_cursor: Some("abc".to_string()),
+            dropped_rows: None,
         };
         let json = serde_json::to_value(&meta).unwrap();
         assert_eq!(json["has_more"], true);
         assert!(json.get("truncated").is_none()); // skipped when false
         assert_eq!(json["next_cursor"], "abc");
+        assert!(json.get("dropped_rows").is_none()); // skipped when None
 
         let meta_no_cursor = PaginationMeta {
             has_more: false,
             truncated: true,
             next_cursor: None,
+            dropped_rows: None,
         };
         let json = serde_json::to_value(&meta_no_cursor).unwrap();
         assert_eq!(json["truncated"], true);
@@ -803,10 +797,23 @@ mod tests {
             has_more: false,
             truncated: false,
             next_cursor: Some("last_key".to_string()),
+            dropped_rows: None,
         };
         let json = serde_json::to_value(&meta).unwrap();
         assert_eq!(json["has_more"], false);
         assert!(json.get("truncated").is_none());
         assert_eq!(json["next_cursor"], "last_key");
+    }
+
+    #[test]
+    fn test_pagination_meta_dropped_rows_present_when_some() {
+        let meta = PaginationMeta {
+            has_more: true,
+            truncated: false,
+            next_cursor: None,
+            dropped_rows: Some(3),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["dropped_rows"], 3);
     }
 }
