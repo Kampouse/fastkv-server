@@ -28,6 +28,12 @@ fn insert_nested(
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let serde_json::Value::Object(ref mut nested) = entry {
             insert_nested(nested, &parts[1..], value);
+        } else {
+            tracing::warn!(
+                target: "fastkv-server",
+                key = parts[0],
+                "tree path conflict: cannot nest under a scalar value"
+            );
         }
     }
 }

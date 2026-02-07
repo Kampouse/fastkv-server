@@ -56,6 +56,9 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
         Some(idx) => (&pattern[..idx], &pattern[idx + 1..]),
         None => {
             // Just an account ID with no key path — treat as recursive wildcard on all keys
+            if pattern.len() > MAX_ACCOUNT_ID_LENGTH {
+                return Err(ApiError::InvalidParameter("account ID too long".to_string()));
+            }
             return Ok(KeyPattern::RecursiveWildcard {
                 account_id: pattern.to_string(),
                 key_prefix: String::new(),
@@ -310,7 +313,7 @@ pub async fn social_get_handler(
                     format: None,
                 };
 
-                let entries = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -344,7 +347,7 @@ pub async fn social_get_handler(
                     format: None,
                 };
 
-                let entries = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -369,14 +372,16 @@ pub async fn social_get_handler(
             }
             KeyPattern::WildcardAccount { key } => {
                 // Use by-key view to find all predecessors with this exact key
-                let by_key_params = ByKeyParams {
+                let by_key_params = WritersParams {
                     key: key.clone(),
                     current_account_id: contract.to_string(),
+                    predecessor_id: None,
+                    exclude_null: None,
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                 };
-                let entries = scylladb.query_by_key(&by_key_params).await?;
+                let entries = scylladb.query_writers(&by_key_params).await?.0;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -395,10 +400,11 @@ pub async fn social_get_handler(
         }
     }
 
+    let mut response = HttpResponse::Ok();
     if truncated {
-        result_root.insert("warning".to_string(), serde_json::json!("results_truncated"));
+        response.insert_header(("X-Results-Truncated", "true"));
     }
-    Ok(HttpResponse::Ok().json(serde_json::Value::Object(result_root)))
+    Ok(response.json(serde_json::Value::Object(result_root)))
 }
 
 /// SocialDB-compatible keys: query key structure
@@ -488,7 +494,7 @@ pub async fn social_keys_handler(
                     format: None,
                 };
 
-                let entries = scylladb.query_kv_with_pagination(&query).await?;
+                let (entries, ..) = scylladb.query_kv_with_pagination(&query).await?;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -581,14 +587,16 @@ pub async fn social_keys_handler(
                 }
             }
             KeyPattern::WildcardAccount { key } => {
-                let by_key_params = ByKeyParams {
+                let by_key_params = WritersParams {
                     key: key.clone(),
                     current_account_id: contract.to_string(),
+                    predecessor_id: None,
+                    exclude_null: None,
                     limit: MAX_SOCIAL_RESULTS,
                     offset: 0,
                     fields: None,
                 };
-                let entries = scylladb.query_by_key(&by_key_params).await?;
+                let entries = scylladb.query_writers(&by_key_params).await?.0;
                 if entries.len() >= MAX_SOCIAL_RESULTS {
                     truncated = true;
                 }
@@ -615,10 +623,11 @@ pub async fn social_keys_handler(
         }
     }
 
+    let mut response = HttpResponse::Ok();
     if truncated {
-        result_root.insert("warning".to_string(), serde_json::json!("results_truncated"));
+        response.insert_header(("X-Results-Truncated", "true"));
     }
-    Ok(HttpResponse::Ok().json(serde_json::Value::Object(result_root)))
+    Ok(response.json(serde_json::Value::Object(result_root)))
 }
 
 /// Query SocialDB index entries by action and key
@@ -696,11 +705,10 @@ pub async fn social_profile_handler(
         format: None,
     };
 
-    let entries = scylladb.query_kv_with_pagination(&params).await?;
+    let (entries, ..) = scylladb.query_kv_with_pagination(&params).await?;
 
     let items: Vec<(String, String)> = entries.into_iter()
         .map(|e| {
-            // Strip "profile/" prefix so tree is rooted at profile fields
             let key = e.key.strip_prefix("profile/").unwrap_or(&e.key).to_string();
             (key, e.value)
         })
@@ -789,9 +797,8 @@ pub async fn social_following_handler(
         format: None,
     };
 
-    let entries = scylladb.query_kv_with_pagination(&params).await?;
+    let (entries, ..) = scylladb.query_kv_with_pagination(&params).await?;
 
-    // Strip "graph/follow/" prefix to get account IDs
     let accounts: Vec<String> = entries.into_iter()
         .filter_map(|e| e.key.strip_prefix("graph/follow/").map(|s| s.to_string()))
         .collect();
@@ -857,7 +864,7 @@ pub async fn social_account_feed_handler(
     };
 
     let posts: Vec<IndexEntry> = if include_replies {
-        let (entries, comment_entries) = futures::future::try_join(
+        let ((entries, ..), (comment_entries, ..)) = futures::future::try_join(
             scylladb.get_kv_history(&history_params),
             scylladb.get_kv_history(&comment_params),
         ).await?;
@@ -876,8 +883,8 @@ pub async fn social_account_feed_handler(
         combined.truncate(query.limit);
         combined
     } else {
-        scylladb.get_kv_history(&history_params).await?
-            .into_iter().map(to_index_entry).collect()
+        let (entries, ..) = scylladb.get_kv_history(&history_params).await?;
+        entries.into_iter().map(to_index_entry).collect()
     };
 
     Ok(HttpResponse::Ok().json(SocialFeedResponse { posts }))

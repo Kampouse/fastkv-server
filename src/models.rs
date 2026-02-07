@@ -61,10 +61,12 @@ pub struct ContractAccountRow {
     pub predecessor_id: String,
 }
 
-// API response - keeps NEAR/FastData field names for compatibility
+// API response
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct KvEntry {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
     pub value: String,
@@ -81,11 +83,11 @@ impl KvEntry {
         if let Some(field_set) = fields {
             let mut map = serde_json::Map::new();
 
-            if field_set.contains("predecessor_id") {
-                map.insert("predecessor_id".to_string(), serde_json::json!(&self.predecessor_id));
+            if field_set.contains("accountId") {
+                map.insert("accountId".to_string(), serde_json::json!(&self.predecessor_id));
             }
-            if field_set.contains("current_account_id") {
-                map.insert("current_account_id".to_string(), serde_json::json!(&self.current_account_id));
+            if field_set.contains("contractId") {
+                map.insert("contractId".to_string(), serde_json::json!(&self.current_account_id));
             }
             if field_set.contains("key") {
                 map.insert("key".to_string(), serde_json::json!(&self.key));
@@ -154,23 +156,18 @@ impl From<KvHistoryRow> for KvEntry {
     }
 }
 
-// Response structs
+// Standardized paginated response for all list endpoints
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct QueryResponse {
-    pub entries: Vec<KvEntry>,
+pub struct PaginatedResponse<T: Serialize> {
+    pub data: Vec<T>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct TreeResponse {
     pub tree: serde_json::Value,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct AccountsResponse {
-    pub accounts: Vec<String>,
-    pub count: usize,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -180,10 +177,12 @@ pub struct HealthResponse {
     pub database: Option<String>,
 }
 
-// Query parameter structs - aligned with official FastData protocol
+// Query parameter structs
 #[derive(Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct GetParams {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
     #[serde(default)]
@@ -209,7 +208,9 @@ pub fn validate_limit(limit: usize) -> Result<(), ApiError> {
 
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct QueryParams {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     #[serde(default)]
     pub key_prefix: Option<String>,
@@ -226,10 +227,16 @@ pub struct QueryParams {
 }
 
 
+// GET /v1/kv/writers — replaces /v1/kv/reverse and /v1/kv/by-key
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
-pub struct ReverseParams {
+pub struct WritersParams {
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
+    /// Optional: filter to a specific writer account
+    #[serde(rename = "accountId")]
+    #[serde(default)]
+    pub predecessor_id: Option<String>,
     #[serde(default)]
     pub exclude_null: Option<bool>,
     #[serde(default = "default_limit")]
@@ -237,7 +244,7 @@ pub struct ReverseParams {
     #[serde(default)]
     pub offset: usize,
     #[serde(default)]
-    pub fields: Option<String>, // Comma-separated field names
+    pub fields: Option<String>,
 }
 
 
@@ -248,7 +255,9 @@ fn default_limit() -> usize {
 // History query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct HistoryParams {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
     #[serde(default = "default_history_limit")]
@@ -275,6 +284,7 @@ fn default_order_desc() -> String {
 // Accounts query parameters (list unique predecessors for a current_account_id + key pattern)
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct AccountsParams {
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
     #[serde(default)]
@@ -288,8 +298,8 @@ pub struct AccountsParams {
 // Accounts-by-contract query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct AccountsQueryParams {
-    /// Contract account to query. Defaults to "contextual.near" (note: social endpoints default to "social.near").
-    #[serde(default = "default_contract_id")]
+    /// Contract account to query (required).
+    #[serde(rename = "contractId")]
     pub contract_id: String,
     /// Optional key filter. Recommended for large contracts to avoid expensive full-partition scans.
     #[serde(default)]
@@ -300,28 +310,12 @@ pub struct AccountsQueryParams {
     pub offset: usize,
 }
 
-fn default_contract_id() -> String {
-    "contextual.near".to_string()
-}
-
-// By-key query parameters (reverse lookup by exact key across all predecessors)
-#[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
-pub struct ByKeyParams {
-    pub key: String,
-    pub current_account_id: String,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-    #[serde(default)]
-    pub offset: usize,
-    #[serde(default)]
-    pub fields: Option<String>,
-}
-
-
 // Diff query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct DiffParams {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub key: String,
     pub block_height_a: i64,
@@ -339,7 +333,9 @@ pub struct DiffResponse {
 // Timeline query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct TimelineParams {
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -358,9 +354,9 @@ pub struct TimelineParams {
 // Batch query structs
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct BatchQuery {
-    #[serde(alias = "predecessor")]
+    #[serde(rename = "accountId")]
     pub predecessor_id: String,
-    #[serde(alias = "current_account")]
+    #[serde(rename = "contractId")]
     pub current_account_id: String,
     pub keys: Vec<String>,
 }
@@ -372,11 +368,6 @@ pub struct BatchResultItem {
     pub found: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct BatchResponse {
-    pub results: Vec<BatchResultItem>,
 }
 
 // ===== Social API types =====
@@ -587,10 +578,11 @@ pub struct EdgeSourceEntry {
     pub block_height: u64,
 }
 
+// StatusResponse for /v1/status
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct EdgesResponse {
-    pub sources: Vec<EdgeSourceEntry>,
-    pub count: usize,
+pub struct StatusResponse {
+    pub indexer_block: Option<u64>,
+    pub timestamp: String,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

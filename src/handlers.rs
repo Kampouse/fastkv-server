@@ -15,15 +15,28 @@ pub(crate) async fn require_db(state: &AppState) -> Result<RwLockReadGuard<'_, O
     Ok(guard)
 }
 
-fn respond_with_entries(entries: Vec<KvEntry>, fields: &Option<HashSet<String>>) -> HttpResponse {
+fn respond_paginated(
+    entries: Vec<KvEntry>,
+    has_more: bool,
+    truncated: bool,
+    fields: &Option<HashSet<String>>,
+) -> HttpResponse {
     if fields.is_some() {
         let filtered: Vec<_> = entries
             .into_iter()
             .map(|e| e.to_json_with_fields(fields))
             .collect();
-        HttpResponse::Ok().json(serde_json::json!({ "entries": filtered }))
+        let mut resp = serde_json::json!({ "data": filtered, "has_more": has_more });
+        if truncated {
+            resp["truncated"] = serde_json::json!(true);
+        }
+        HttpResponse::Ok().json(resp)
     } else {
-        HttpResponse::Ok().json(QueryResponse { entries })
+        HttpResponse::Ok().json(PaginatedResponse {
+            data: entries,
+            has_more,
+            truncated,
+        })
     }
 }
 
@@ -126,14 +139,14 @@ pub async fn get_kv_handler(
     query: web::Query<GetParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.predecessor_id, "predecessor_id")?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %query.predecessor_id,
-        current_account_id = %query.current_account_id,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
         key = %query.key,
         "GET /v1/kv/get"
     );
@@ -157,7 +170,7 @@ pub async fn get_kv_handler(
     path = "/v1/kv/query",
     params(QueryParams),
     responses(
-        (status = 200, description = "List of matching entries", body = QueryResponse),
+        (status = 200, description = "List of matching entries"),
         (status = 400, description = "Invalid parameters", body = ApiError)
     ),
     tag = "kv"
@@ -167,8 +180,8 @@ pub async fn query_kv_handler(
     query: web::Query<QueryParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.predecessor_id, "predecessor_id")?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_limit(query.limit)?;
     validate_offset(query.offset)?;
     validate_prefix(&query.key_prefix)?;
@@ -183,8 +196,8 @@ pub async fn query_kv_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %query.predecessor_id,
-        current_account_id = %query.current_account_id,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
         key_prefix = ?query.key_prefix,
         limit = query.limit,
         offset = query.offset,
@@ -192,11 +205,10 @@ pub async fn query_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+    let (entries, has_more) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .query_kv_with_pagination(&query)
         .await?;
 
-    // Tree format: transform flat entries into nested JSON
     if query.format.as_deref() == Some("tree") {
         let items: Vec<(String, String)> = entries
             .into_iter()
@@ -207,7 +219,7 @@ pub async fn query_kv_handler(
     }
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_with_entries(entries, &fields))
+    Ok(respond_paginated(entries, has_more, false, &fields))
 }
 
 /// Get historical versions of a KV entry
@@ -216,7 +228,7 @@ pub async fn query_kv_handler(
     path = "/v1/kv/history",
     params(HistoryParams),
     responses(
-        (status = 200, description = "List of historical entries", body = QueryResponse),
+        (status = 200, description = "List of historical entries"),
         (status = 400, description = "Invalid parameters", body = ApiError)
     ),
     tag = "kv"
@@ -226,8 +238,8 @@ pub async fn history_kv_handler(
     query: web::Query<HistoryParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.predecessor_id, "predecessor_id")?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     validate_limit(query.limit)?;
 
@@ -238,6 +250,11 @@ pub async fn history_kv_handler(
         ));
     }
 
+    if query.from_block.is_some_and(|v| v < 0) || query.to_block.is_some_and(|v| v < 0) {
+        return Err(ApiError::InvalidParameter(
+            "block heights cannot be negative".to_string(),
+        ));
+    }
     if let (Some(from), Some(to)) = (query.from_block, query.to_block) {
         if from > to {
             return Err(ApiError::InvalidParameter(
@@ -248,8 +265,8 @@ pub async fn history_kv_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %query.predecessor_id,
-        current_account_id = %query.current_account_id,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
         key = %query.key,
         limit = query.limit,
         order = %query.order,
@@ -259,90 +276,55 @@ pub async fn history_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .get_kv_history(&query)
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_with_entries(entries, &fields))
+    Ok(respond_paginated(entries, has_more, truncated, &fields))
 }
 
-/// Reverse lookup: find all predecessor_ids that wrote to a given key
+/// Find all writers for a key under a contract, with optional account filter
 #[utoipa::path(
     get,
-    path = "/v1/kv/reverse",
-    params(ReverseParams),
+    path = "/v1/kv/writers",
+    params(WritersParams),
     responses(
-        (status = 200, description = "List of entries from different predecessors", body = QueryResponse),
+        (status = 200, description = "List of entries from writers"),
         (status = 400, description = "Invalid parameters", body = ApiError)
     ),
     tag = "kv"
 )]
-#[get("/v1/kv/reverse")]
-pub async fn reverse_kv_handler(
-    query: web::Query<ReverseParams>,
+#[get("/v1/kv/writers")]
+pub async fn writers_handler(
+    query: web::Query<WritersParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     validate_limit(query.limit)?;
     validate_offset(query.offset)?;
+    if let Some(ref pred) = query.predecessor_id {
+        validate_account_id(pred, "accountId")?;
+    }
 
     tracing::info!(
         target: PROJECT_ID,
-        current_account_id = %query.current_account_id,
+        contractId = %query.current_account_id,
         key = %query.key,
+        accountId = ?query.predecessor_id,
         limit = query.limit,
         offset = query.offset,
-        "GET /v1/kv/reverse"
+        "GET /v1/kv/writers"
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .reverse_kv_with_dedup(&query)
+    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+        .query_writers(&query)
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_with_entries(entries, &fields))
-}
-
-/// Lookup by exact key: find all predecessors who wrote to a specific key for a given account
-#[utoipa::path(
-    get,
-    path = "/v1/kv/by-key",
-    params(ByKeyParams),
-    responses(
-        (status = 200, description = "List of entries matching the key", body = QueryResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError)
-    ),
-    tag = "kv"
-)]
-#[get("/v1/kv/by-key")]
-pub async fn by_key_handler(
-    query: web::Query<ByKeyParams>,
-    app_state: web::Data<AppState>,
-) -> Result<HttpResponse, ApiError> {
-    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
-    validate_limit(query.limit)?;
-    validate_offset(query.offset)?;
-
-    tracing::info!(
-        target: PROJECT_ID,
-        key = %query.key,
-        current_account_id = %query.current_account_id,
-        limit = query.limit,
-        offset = query.offset,
-        "GET /v1/kv/by-key"
-    );
-
-    let db = require_db(&app_state).await?;
-    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
-        .query_by_key(&query)
-        .await?;
-
-    let fields = parse_field_set(&query.fields);
-    Ok(respond_with_entries(entries, &fields))
+    Ok(respond_paginated(entries, has_more, truncated, &fields))
 }
 
 /// List unique writer accounts for a contract.
@@ -357,7 +339,7 @@ pub async fn by_key_handler(
     path = "/v1/kv/accounts",
     params(AccountsQueryParams),
     responses(
-        (status = 200, description = "List of writer accounts", body = AccountsResponse),
+        (status = 200, description = "List of writer accounts"),
         (status = 400, description = "Invalid parameters", body = ApiError),
         (status = 503, description = "Database unavailable", body = ApiError),
     ),
@@ -368,7 +350,7 @@ pub async fn accounts_handler(
     query: web::Query<AccountsQueryParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.contract_id, "contract_id")?;
+    validate_account_id(&query.contract_id, "contractId")?;
     validate_limit(query.limit)?;
     validate_offset(query.offset)?;
     if let Some(ref key) = query.key {
@@ -377,7 +359,7 @@ pub async fn accounts_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        contract_id = %query.contract_id,
+        contractId = %query.contract_id,
         key = ?query.key,
         limit = query.limit,
         offset = query.offset,
@@ -385,7 +367,7 @@ pub async fn accounts_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (accounts, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+    let (accounts, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .query_accounts_by_contract(
             &query.contract_id,
             query.key.as_deref(),
@@ -394,8 +376,11 @@ pub async fn accounts_handler(
         )
         .await?;
 
-    let count = accounts.len();
-    Ok(HttpResponse::Ok().json(AccountsResponse { accounts, count, truncated }))
+    Ok(HttpResponse::Ok().json(PaginatedResponse {
+        data: accounts,
+        has_more,
+        truncated,
+    }))
 }
 
 /// Compare a key's value at two different block heights
@@ -414,14 +399,14 @@ pub async fn diff_kv_handler(
     query: web::Query<DiffParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.predecessor_id, "predecessor_id")?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %query.predecessor_id,
-        current_account_id = %query.current_account_id,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
         key = %query.key,
         block_height_a = query.block_height_a,
         block_height_b = query.block_height_b,
@@ -456,7 +441,7 @@ pub async fn diff_kv_handler(
     path = "/v1/kv/timeline",
     params(TimelineParams),
     responses(
-        (status = 200, description = "Chronological list of all writes", body = QueryResponse),
+        (status = 200, description = "Chronological list of all writes"),
         (status = 400, description = "Invalid parameters", body = ApiError)
     ),
     tag = "kv"
@@ -466,8 +451,8 @@ pub async fn timeline_kv_handler(
     query: web::Query<TimelineParams>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&query.predecessor_id, "predecessor_id")?;
-    validate_account_id(&query.current_account_id, "current_account_id")?;
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
     validate_limit(query.limit)?;
     validate_offset(query.offset)?;
 
@@ -478,6 +463,11 @@ pub async fn timeline_kv_handler(
         ));
     }
 
+    if query.from_block.is_some_and(|v| v < 0) || query.to_block.is_some_and(|v| v < 0) {
+        return Err(ApiError::InvalidParameter(
+            "block heights cannot be negative".to_string(),
+        ));
+    }
     if let (Some(from), Some(to)) = (query.from_block, query.to_block) {
         if from > to {
             return Err(ApiError::InvalidParameter(
@@ -488,8 +478,8 @@ pub async fn timeline_kv_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %query.predecessor_id,
-        current_account_id = %query.current_account_id,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
         limit = query.limit,
         offset = query.offset,
         order = %query.order,
@@ -499,12 +489,12 @@ pub async fn timeline_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let entries = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+    let (entries, has_more, truncated) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .get_kv_timeline(&query)
         .await?;
 
     let fields = parse_field_set(&query.fields);
-    Ok(respond_with_entries(entries, &fields))
+    Ok(respond_paginated(entries, has_more, truncated, &fields))
 }
 
 /// Batch lookup: get values for multiple keys in a single request
@@ -513,7 +503,7 @@ pub async fn timeline_kv_handler(
     path = "/v1/kv/batch",
     request_body = BatchQuery,
     responses(
-        (status = 200, description = "Batch results", body = BatchResponse),
+        (status = 200, description = "Batch results"),
         (status = 400, description = "Invalid parameters", body = ApiError)
     ),
     tag = "kv"
@@ -523,8 +513,8 @@ pub async fn batch_kv_handler(
     body: web::Json<BatchQuery>,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
-    validate_account_id(&body.predecessor_id, "predecessor_id")?;
-    validate_account_id(&body.current_account_id, "current_account_id")?;
+    validate_account_id(&body.predecessor_id, "accountId")?;
+    validate_account_id(&body.current_account_id, "contractId")?;
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter(
             "keys cannot be empty".to_string(),
@@ -545,8 +535,8 @@ pub async fn batch_kv_handler(
 
     tracing::info!(
         target: PROJECT_ID,
-        predecessor_id = %body.predecessor_id,
-        current_account_id = %body.current_account_id,
+        accountId = %body.predecessor_id,
+        contractId = %body.current_account_id,
         key_count = body.keys.len(),
         "POST /v1/kv/batch"
     );
@@ -594,7 +584,7 @@ pub async fn batch_kv_handler(
     .collect()
     .await;
 
-    Ok(HttpResponse::Ok().json(BatchResponse { results: items }))
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": items })))
 }
 
 /// List edge sources for a given edge type and target
@@ -603,7 +593,7 @@ pub async fn batch_kv_handler(
     path = "/v1/kv/edges",
     params(EdgesParams),
     responses(
-        (status = 200, description = "List of edge sources", body = EdgesResponse),
+        (status = 200, description = "List of edge sources"),
         (status = 400, description = "Invalid parameters", body = ApiError),
         (status = 503, description = "Database unavailable", body = ApiError),
     ),
@@ -618,12 +608,15 @@ pub async fn edges_handler(
     validate_account_id(&query.target, "target")?;
     validate_limit(query.limit)?;
 
-    if query.after_source.is_none() {
-        validate_offset(query.offset)?;
-    }
-
     if let Some(ref cursor) = query.after_source {
         validate_account_id(cursor, "after_source")?;
+        if query.offset > 0 {
+            return Err(ApiError::InvalidParameter(
+                "cannot use both 'after_source' cursor and 'offset'".to_string(),
+            ));
+        }
+    } else {
+        validate_offset(query.offset)?;
     }
 
     tracing::info!(
@@ -637,7 +630,7 @@ pub async fn edges_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let sources = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
+    let (sources, has_more) = db.as_ref().ok_or(ApiError::DatabaseUnavailable)?
         .query_edges(
             &query.edge_type,
             &query.target,
@@ -647,8 +640,11 @@ pub async fn edges_handler(
         )
         .await?;
 
-    let count = sources.len();
-    Ok(HttpResponse::Ok().json(EdgesResponse { sources, count }))
+    Ok(HttpResponse::Ok().json(PaginatedResponse {
+        data: sources,
+        has_more,
+        truncated: false,
+    }))
 }
 
 /// Count edges for a given edge type and target
@@ -688,5 +684,30 @@ pub async fn edges_count_handler(
         target: query.target.clone(),
         count,
     }))
+}
+
+/// Indexer status: block height and server time
+#[utoipa::path(
+    get,
+    path = "/v1/status",
+    responses(
+        (status = 200, description = "Indexer status", body = StatusResponse),
+    ),
+    tag = "kv"
+)]
+#[get("/v1/status")]
+pub async fn status_handler(
+    app_state: web::Data<AppState>,
+) -> HttpResponse {
+    let guard = app_state.scylladb.read().await;
+    let indexer_block = match guard.as_ref() {
+        Some(db) => db.get_indexer_block_height().await.ok().flatten(),
+        None => None,
+    };
+
+    HttpResponse::Ok().json(StatusResponse {
+        indexer_block,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    })
 }
 

@@ -2,7 +2,7 @@ use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::statement::prepared::PreparedStatement;
 
-use crate::models::{AccountsParams, ByKeyParams, ContractAccountRow, EdgeRow, EdgeSourceEntry, HistoryParams, KvEntry, KvHistoryRow, KvPredecessorRow, KvRow, QueryParams, ReverseParams, TimelineParams, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN, bigint_to_u64};
+use crate::models::{AccountsParams, ContractAccountRow, EdgeRow, EdgeSourceEntry, HistoryParams, KvEntry, KvHistoryRow, KvPredecessorRow, KvRow, QueryParams, WritersParams, TimelineParams, MAX_DEDUP_SCAN, MAX_HISTORY_SCAN, bigint_to_u64};
 use crate::queries::build_prefix_query;
 use fastnear_primitives::types::ChainId;
 use rustls::pki_types::pem::PemObject;
@@ -28,19 +28,18 @@ pub struct ScyllaDb {
     get_kv_history: PreparedStatement,
     get_kv_at_block: PreparedStatement,
     get_kv_timeline: PreparedStatement,
-    by_key: PreparedStatement,
     accounts_by_key: PreparedStatement,
     accounts_by_contract: PreparedStatement,
     accounts_by_contract_key: PreparedStatement,
     edges_list: PreparedStatement,
     edges_list_cursor: PreparedStatement,
     edges_count: PreparedStatement,
+    meta_query: PreparedStatement,
 
     pub scylla_session: Session,
     pub table_name: String,
     pub history_table_name: String,
     pub reverse_view_name: String,
-    pub by_key_view_name: String,
     pub kv_accounts_table_name: String,
     pub kv_edges_table_name: String,
 }
@@ -145,8 +144,6 @@ impl ScyllaDb {
             .unwrap_or_else(|_| "s_kv".to_string());
         let reverse_view_name = env::var("REVERSE_VIEW_NAME")
             .unwrap_or_else(|_| "mv_kv_cur_key".to_string());
-        let by_key_view_name = env::var("BY_KEY_VIEW_NAME")
-            .unwrap_or_else(|_| "mv_kv_key".to_string());
         let kv_accounts_table_name = env::var("KV_ACCOUNTS_TABLE_NAME")
             .unwrap_or_else(|_| "kv_accounts".to_string());
         let kv_edges_table_name = env::var("KV_EDGES_TABLE_NAME")
@@ -155,7 +152,6 @@ impl ScyllaDb {
         validate_identifier(&table_name, "TABLE_NAME")?;
         validate_identifier(&history_table_name, "HISTORY_TABLE_NAME")?;
         validate_identifier(&reverse_view_name, "REVERSE_VIEW_NAME")?;
-        validate_identifier(&by_key_view_name, "BY_KEY_VIEW_NAME")?;
         validate_identifier(&kv_accounts_table_name, "KV_ACCOUNTS_TABLE_NAME")?;
         validate_identifier(&kv_edges_table_name, "KV_EDGES_TABLE_NAME")?;
 
@@ -180,12 +176,12 @@ impl ScyllaDb {
             ).await?,
             reverse_kv: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM {} WHERE current_account_id = ? AND key = ?", columns, reverse_view_name),
+                &format!("SELECT {} FROM {} WHERE current_account_id = ? AND key = ? ORDER BY key DESC, block_height DESC, order_id DESC, predecessor_id DESC", columns, reverse_view_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             get_kv_history: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ?", history_columns, history_table_name),
+                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ? AND block_height >= ? AND block_height <= ?", history_columns, history_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             get_kv_at_block: Self::prepare_query(
@@ -198,14 +194,9 @@ impl ScyllaDb {
                 &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ?", history_columns, history_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
-            by_key: Self::prepare_query(
-                &scylla_session,
-                &format!("SELECT {} FROM {} WHERE key = ?", columns, by_key_view_name),
-                scylla::frame::types::Consistency::LocalOne,
-            ).await?,
             accounts_by_key: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT predecessor_id, value FROM {} WHERE current_account_id = ? AND key = ?", reverse_view_name),
+                &format!("SELECT predecessor_id, value FROM {} WHERE current_account_id = ? AND key = ? ORDER BY key DESC, block_height DESC, order_id DESC, predecessor_id DESC", reverse_view_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             // LocalQuorum for kv_accounts: this table is populated asynchronously so
@@ -235,11 +226,15 @@ impl ScyllaDb {
                 &format!("SELECT COUNT(*) FROM {} WHERE edge_type = ? AND target = ?", kv_edges_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
+            meta_query: Self::prepare_query(
+                &scylla_session,
+                "SELECT last_processed_block_height FROM meta WHERE suffix = ?",
+                scylla::frame::types::Consistency::LocalOne,
+            ).await?,
             scylla_session,
             table_name,
             history_table_name,
             reverse_view_name,
-            by_key_view_name,
             kv_accounts_table_name,
             kv_edges_table_name,
         })
@@ -304,30 +299,38 @@ impl ScyllaDb {
         Ok(value)
     }
 
-    pub async fn query_by_key(
+    /// Query writers for a key under a contract.
+    /// Uses mv_kv_cur_key view, deduplicates by predecessor_id.
+    /// Optionally filters to a specific writer (predecessor_id).
+    /// Returns (entries, has_more, truncated).
+    pub async fn query_writers(
         &self,
-        params: &ByKeyParams,
-    ) -> anyhow::Result<Vec<KvEntry>> {
+        params: &WritersParams,
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
         let mut rows_stream = self
             .scylla_session
-            .execute_iter(
-                self.by_key.clone(),
-                (&params.key,),
-            )
+            .execute_iter(self.reverse_kv.clone(), (&params.current_account_id, &params.key))
             .await?
             .rows_stream::<KvRow>()?;
 
-        let mut skipped = 0;
-        let mut entries = Vec::with_capacity(params.limit);
+        let mut seen_predecessors = HashSet::new();
+        let mut entries = Vec::new();
+        let target_count = params.offset + params.limit + 1;
+        let mut truncated = false;
 
         while let Some(row_result) = rows_stream.next().await {
+            if seen_predecessors.len() >= MAX_DEDUP_SCAN {
+                truncated = true;
+                break;
+            }
+
             let row = match row_result {
                 Ok(row) => row,
                 Err(e) => {
                     tracing::warn!(
                         target: "fastkv-server",
                         error = %e,
-                        "Failed to deserialize row in query_by_key"
+                        "Failed to deserialize row in query_writers"
                     );
                     continue;
                 }
@@ -335,24 +338,40 @@ impl ScyllaDb {
 
             let entry = KvEntry::from(row);
 
-            // Filter by current_account_id in application layer
-            // (can't filter in CQL due to clustering column order)
-            if entry.current_account_id != params.current_account_id {
+            // Deduplicate by predecessor_id (keep first = most recent due to DESC ordering)
+            if seen_predecessors.contains(&entry.predecessor_id) {
                 continue;
             }
+            seen_predecessors.insert(entry.predecessor_id.clone());
 
-            if skipped < params.offset {
-                skipped += 1;
+            // Filter by specific writer if requested
+            if let Some(ref pred) = params.predecessor_id {
+                if entry.predecessor_id != *pred {
+                    continue;
+                }
+            }
+
+            // Apply exclude_null filter
+            if params.exclude_null.unwrap_or(false) && entry.value == "null" {
                 continue;
             }
 
             entries.push(entry);
-            if entries.len() >= params.limit {
+
+            if entries.len() >= target_count {
                 break;
             }
         }
 
-        Ok(entries)
+        let result: Vec<KvEntry> = entries
+            .into_iter()
+            .skip(params.offset)
+            .collect();
+        let has_more = result.len() > params.limit;
+        let mut result = result;
+        result.truncate(params.limit);
+
+        Ok((result, has_more, truncated))
     }
 
     pub async fn query_accounts(
@@ -414,18 +433,15 @@ impl ScyllaDb {
         Ok(result)
     }
 
-    /// Returns `(accounts, truncated)` where `truncated` is true if the scan hit MAX_DEDUP_SCAN.
-    ///
-    /// When `key` is provided, the kv_accounts PK `(current_account_id, key, predecessor_id)`
-    /// guarantees uniqueness so no dedup is needed. Without a key filter, the same predecessor
-    /// can appear across different keys and must be deduplicated.
+    /// Returns `(accounts, has_more, truncated)`.
+    /// `truncated` is true if scan hit MAX_DEDUP_SCAN.
     pub async fn query_accounts_by_contract(
         &self,
         contract_id: &str,
         key: Option<&str>,
         limit: usize,
         offset: usize,
-    ) -> anyhow::Result<(Vec<String>, bool)> {
+    ) -> anyhow::Result<(Vec<String>, bool, bool)> {
         let needs_dedup = key.is_none();
 
         let mut rows_stream = match key {
@@ -449,7 +465,7 @@ impl ScyllaDb {
 
         let mut seen = HashSet::new();
         let mut accounts = Vec::new();
-        let target_count = offset + limit;
+        let target_count = offset + limit + 1;
         let mut truncated = false;
 
         while let Some(row_result) = rows_stream.next().await {
@@ -487,18 +503,20 @@ impl ScyllaDb {
         let result: Vec<String> = accounts
             .into_iter()
             .skip(offset)
-            .take(limit)
             .collect();
+        let has_more = result.len() > limit;
+        let mut result = result;
+        result.truncate(limit);
 
-        Ok((result, truncated))
+        Ok((result, has_more, truncated))
     }
 
+    /// Returns (entries, has_more).
     pub async fn query_kv_with_pagination(
         &self,
         params: &QueryParams,
-    ) -> anyhow::Result<Vec<KvEntry>> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool)> {
         let mut rows_stream = if let Some(prefix) = &params.key_prefix {
-            // Dynamic query with prefix range
             let (stmt, prefix_start, prefix_end) = build_prefix_query(prefix, &self.table_name);
             self.scylla_session
                 .query_iter(
@@ -513,7 +531,6 @@ impl ScyllaDb {
                 .await?
                 .rows_stream::<KvRow>()?
         } else {
-            // Prepared query without prefix
             self.scylla_session
                 .execute_iter(
                     self.query_kv_no_prefix.clone(),
@@ -525,7 +542,7 @@ impl ScyllaDb {
 
         let exclude_null = params.exclude_null.unwrap_or(false);
         let mut skipped = 0;
-        let mut entries = Vec::with_capacity(params.limit);
+        let mut entries = Vec::with_capacity(params.limit + 1);
 
         while let Some(row_result) = rows_stream.next().await {
             let row = match row_result {
@@ -552,76 +569,14 @@ impl ScyllaDb {
             }
 
             entries.push(entry);
-            if entries.len() >= params.limit {
+            if entries.len() > params.limit {
                 break;
             }
         }
 
-        Ok(entries)
-    }
-
-    pub async fn reverse_kv_with_dedup(
-        &self,
-        params: &ReverseParams,
-    ) -> anyhow::Result<Vec<KvEntry>> {
-        let mut rows_stream = self
-            .scylla_session
-            .execute_iter(self.reverse_kv.clone(), (&params.current_account_id, &params.key))
-            .await?
-            .rows_stream::<KvRow>()?;
-
-        let mut seen_predecessors = HashSet::new();
-        let mut entries = Vec::new();
-        let target_count = params.offset + params.limit;
-
-        while let Some(row_result) = rows_stream.next().await {
-            // Safety limit: stop if we've seen too many unique predecessors
-            if seen_predecessors.len() >= MAX_DEDUP_SCAN {
-                break;
-            }
-
-            let row = match row_result {
-                Ok(row) => row,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "fastkv-server",
-                        error = %e,
-                        "Failed to deserialize row in reverse_kv_with_dedup"
-                    );
-                    continue;
-                }
-            };
-
-            let entry = KvEntry::from(row);
-
-            // Deduplicate by predecessor_id (keep first = most recent)
-            if seen_predecessors.contains(&entry.predecessor_id) {
-                continue;
-            }
-
-            seen_predecessors.insert(entry.predecessor_id.clone());
-
-            // Apply exclude_null filter
-            if params.exclude_null.unwrap_or(false) && entry.value == "null" {
-                continue;
-            }
-
-            entries.push(entry);
-
-            // Early termination when we have enough entries
-            if entries.len() >= target_count {
-                break;
-            }
-        }
-
-        // Apply offset and limit
-        let result: Vec<KvEntry> = entries
-            .into_iter()
-            .skip(params.offset)
-            .take(params.limit)
-            .collect();
-
-        Ok(result)
+        let has_more = entries.len() > params.limit;
+        entries.truncate(params.limit);
+        Ok((entries, has_more))
     }
 
     pub async fn get_kv_at_block(
@@ -651,10 +606,11 @@ impl ScyllaDb {
         Ok(entry)
     }
 
+    /// Returns (entries, has_more, truncated).
     pub async fn get_kv_timeline(
         &self,
         params: &TimelineParams,
-    ) -> anyhow::Result<Vec<KvEntry>> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
@@ -666,10 +622,12 @@ impl ScyllaDb {
 
         let mut entries: Vec<KvEntry> = Vec::new();
         let mut scanned = 0usize;
+        let mut truncated = false;
 
         while let Some(row_result) = rows_stream.next().await {
             scanned += 1;
             if scanned > MAX_HISTORY_SCAN {
+                truncated = true;
                 break;
             }
 
@@ -708,12 +666,15 @@ impl ScyllaDb {
         let result: Vec<KvEntry> = entries
             .into_iter()
             .skip(params.offset)
-            .take(params.limit)
             .collect();
+        let has_more = result.len() > params.limit;
+        let mut result = result;
+        result.truncate(params.limit);
 
-        Ok(result)
+        Ok((result, has_more, truncated))
     }
 
+    /// Returns (entries, has_more).
     pub async fn query_edges(
         &self,
         edge_type: &str,
@@ -721,7 +682,7 @@ impl ScyllaDb {
         limit: usize,
         offset: usize,
         after_source: Option<&str>,
-    ) -> anyhow::Result<Vec<EdgeSourceEntry>> {
+    ) -> anyhow::Result<(Vec<EdgeSourceEntry>, bool)> {
         let mut rows_stream = match after_source {
             Some(cursor) => {
                 self.scylla_session
@@ -738,7 +699,7 @@ impl ScyllaDb {
         };
 
         let mut skipped = 0;
-        let mut entries = Vec::with_capacity(limit);
+        let mut entries = Vec::with_capacity(limit + 1);
 
         while let Some(row_result) = rows_stream.next().await {
             let row = match row_result {
@@ -753,7 +714,6 @@ impl ScyllaDb {
                 }
             };
 
-            // Only apply offset when not using cursor-based pagination
             if after_source.is_none() && skipped < offset {
                 skipped += 1;
                 continue;
@@ -764,12 +724,14 @@ impl ScyllaDb {
                 block_height: bigint_to_u64(row.block_height),
             });
 
-            if entries.len() >= limit {
+            if entries.len() > limit {
                 break;
             }
         }
 
-        Ok(entries)
+        let has_more = entries.len() > limit;
+        entries.truncate(limit);
+        Ok((entries, has_more))
     }
 
     pub async fn count_edges(
@@ -793,28 +755,31 @@ impl ScyllaDb {
         Ok(count)
     }
 
+    /// Returns (entries, has_more, truncated).
     pub async fn get_kv_history(
         &self,
         params: &HistoryParams,
-    ) -> anyhow::Result<Vec<KvEntry>> {
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool)> {
+        let from_block = params.from_block.unwrap_or(0);
+        let to_block = params.to_block.unwrap_or(i64::MAX);
 
-        // Query s_kv table for full history using streaming
-        // Note: s_kv has clustering order by current_account_id, key, block_height, order_id
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
                 self.get_kv_history.clone(),
-                (&params.predecessor_id, &params.current_account_id, &params.key),
+                (&params.predecessor_id, &params.current_account_id, &params.key, from_block, to_block),
             )
             .await?
             .rows_stream::<KvHistoryRow>()?;
 
         let mut entries: Vec<KvEntry> = Vec::new();
         let mut scanned = 0usize;
+        let mut truncated = false;
 
         while let Some(row_result) = rows_stream.next().await {
             scanned += 1;
             if scanned > MAX_HISTORY_SCAN {
+                truncated = true;
                 break;
             }
 
@@ -830,24 +795,9 @@ impl ScyllaDb {
                 }
             };
 
-            let entry = KvEntry::from(row);
-
-            // Apply block height range filters if specified
-            if let Some(from_block) = params.from_block {
-                if entry.block_height < (from_block.max(0) as u64) {
-                    continue;
-                }
-            }
-            if let Some(to_block) = params.to_block {
-                if entry.block_height > (to_block.max(0) as u64) {
-                    continue;
-                }
-            }
-
-            entries.push(entry);
+            entries.push(KvEntry::from(row));
         }
 
-        // Sort by block_height based on order parameter
         entries.sort_by(|a, b| {
             if params.order.to_lowercase() == "asc" {
                 a.block_height.cmp(&b.block_height)
@@ -856,12 +806,32 @@ impl ScyllaDb {
             }
         });
 
-        // Apply limit after filtering and sorting
-        entries.truncate(params.limit);
+        // Skip offset, then check has_more
+        let result: Vec<KvEntry> = entries
+            .into_iter()
+            .collect();
+        let has_more = result.len() > params.limit;
+        let mut result = result;
+        result.truncate(params.limit);
 
-        Ok(entries)
+        Ok((result, has_more, truncated))
     }
 
+    pub async fn get_indexer_block_height(&self) -> anyhow::Result<Option<u64>> {
+        let result = self
+            .scylla_session
+            .execute_unpaged(&self.meta_query, ("kv-1",))
+            .await?
+            .into_rows_result()?;
+
+        let block_height = result
+            .rows::<(i64,)>()?
+            .next()
+            .transpose()?
+            .map(|row| row.0.max(0) as u64);
+
+        Ok(block_height)
+    }
 }
 
 #[cfg(test)]
