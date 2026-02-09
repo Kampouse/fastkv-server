@@ -17,7 +17,7 @@ pub const MAX_HISTORY_SCAN: usize = 10_000;
 pub const MAX_DEDUP_SCAN: usize = 100_000;
 pub const MAX_EDGE_TYPE_LENGTH: usize = 256;
 pub const MAX_SCAN_LIMIT: usize = 1000;
-pub const PROJECT_ID: &str = "fastkv-server";
+pub const PROJECT_ID: &str = "near-garden";
 
 // Raw row from ScyllaDB s_kv_last (matches table schema exactly)
 #[derive(DeserializeRow, Debug, Clone)]

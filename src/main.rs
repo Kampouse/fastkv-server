@@ -115,37 +115,26 @@ async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "scylladb=info,fastkv-server=info".into()),
+                .unwrap_or_else(|_| "scylladb=info,near-garden=info,fastkv-server=info".into()),
         )
         .init();
+
+    tracing::info!(target: PROJECT_ID, "FastKV server starting");
 
     let chain_id: ChainId = env::var("CHAIN_ID")
         .expect("CHAIN_ID required")
         .try_into()
         .expect("Invalid chain id");
 
-    let scylladb: Arc<RwLock<Option<ScyllaDb>>> = match ScyllaDb::new_scylla_session().await {
-        Ok(session) => match ScyllaDb::test_connection(&session).await {
-            Ok(_) => match ScyllaDb::new(chain_id, session).await {
-                Ok(db) => {
-                    tracing::info!(target: PROJECT_ID, "Connected to Scylla");
-                    Arc::new(RwLock::new(Some(db)))
-                }
-                Err(e) => {
-                    tracing::warn!(target: PROJECT_ID, error = %e, "Failed to initialize ScyllaDB, starting without database");
-                    Arc::new(RwLock::new(None))
-                }
-            },
-            Err(e) => {
-                tracing::warn!(target: PROJECT_ID, error = %e, "Failed to connect to ScyllaDB, starting without database");
-                Arc::new(RwLock::new(None))
-            }
-        },
-        Err(e) => {
-            tracing::warn!(target: PROJECT_ID, error = %e, "Failed to create ScyllaDB session, starting without database");
-            Arc::new(RwLock::new(None))
-        }
-    };
+    tracing::info!(target: PROJECT_ID, %chain_id, "Configuration loaded");
+
+    // Validate DB env vars early (they're required by the background connection task)
+    for var in ["SCYLLA_URL", "SCYLLA_USERNAME", "SCYLLA_PASSWORD"] {
+        env::var(var).unwrap_or_else(|_| panic!("{var} must be set"));
+    }
+
+    let scylladb: Arc<RwLock<Option<ScyllaDb>>> = Arc::new(RwLock::new(None));
+    tracing::info!(target: PROJECT_ID, "Database connection deferred to background task");
 
     // Background reconnection task with exponential backoff
     let reconnect_base_secs: u64 = env::var("DB_RECONNECT_INTERVAL_SECS")
@@ -158,17 +147,22 @@ async fn main() -> std::io::Result<()> {
         let scylladb = Arc::clone(&scylladb);
         tokio::spawn(async move {
             let mut delay_secs = reconnect_base_secs;
+            let mut is_initial = true;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                if is_initial {
+                    is_initial = false;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
                 if scylladb.read().await.is_some() {
                     delay_secs = reconnect_base_secs;
                     continue;
                 }
-                tracing::info!(target: PROJECT_ID, delay_secs, "Attempting to reconnect to ScyllaDB...");
+                tracing::info!(target: PROJECT_ID, delay_secs, "Attempting to connect to ScyllaDB...");
                 let session = match ScyllaDb::new_scylla_session().await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB reconnection failed");
+                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB connection failed");
                         delay_secs = (delay_secs * 2).min(reconnect_max_secs);
                         continue;
                     }
@@ -182,7 +176,7 @@ async fn main() -> std::io::Result<()> {
                     Ok(db) => {
                         *scylladb.write().await = Some(db);
                         delay_secs = reconnect_base_secs;
-                        tracing::info!(target: PROJECT_ID, "Successfully reconnected to ScyllaDB");
+                        tracing::info!(target: PROJECT_ID, "Successfully connected to ScyllaDB");
                     }
                     Err(e) => {
                         tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB initialization failed");
@@ -214,6 +208,9 @@ async fn main() -> std::io::Result<()> {
         String,
         std::time::Instant,
     >::new()));
+
+    let port = env::var("PORT").unwrap_or_else(|_| "3001".to_string());
+    tracing::info!(target: PROJECT_ID, %port, "Binding HTTP server");
 
     HttpServer::new(move || {
         let block_cache = Arc::clone(&indexer_block_cache);
@@ -286,10 +283,7 @@ async fn main() -> std::io::Result<()> {
             .service(social_account_feed_handler)
             .service(Files::new("/", "./static").index_file("index.html"))
     })
-    .bind(format!(
-        "0.0.0.0:{}",
-        env::var("PORT").unwrap_or_else(|_| "3001".to_string())
-    ))?
+    .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await?;
 

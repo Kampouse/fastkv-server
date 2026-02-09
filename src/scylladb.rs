@@ -216,6 +216,7 @@ impl ScyllaDb {
 
         let session: Session = SessionBuilder::new()
             .known_node(scylla_url)
+            .connection_timeout(std::time::Duration::from_secs(5))
             .tls_context(tls_config)
             .authenticator_provider(Arc::new(
                 scylla::authentication::PlainTextAuthenticator::new(
