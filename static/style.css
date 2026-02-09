@@ -506,43 +506,77 @@ button:focus-visible {
   margin: 0;
 }
 
-/* Plant panel */
-.plant-panel {
+/* Write panel */
+.write-panel {
   max-height: none;
 }
-.plant-templates {
+.write-header {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  justify-content: space-between;
   margin-bottom: 1rem;
+}
+.write-mode-btn {
+  font-size: .7rem;
+  padding: 0.25rem 0.5rem;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.write-mode-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.write-note {
+  font-size: .7rem;
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-style: italic;
+  margin-bottom: 0.75rem;
+}
+.write-mismatch {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   flex-wrap: wrap;
-}
-.plant-templates button {
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid #c59030;
+  border-radius: var(--radius);
+  background: rgba(197, 144, 48, 0.08);
   font-size: .75rem;
-  padding: 0.3rem 0.6rem;
+  color: #e0b050;
+  font-family: var(--font);
 }
-.plant-label {
+.mismatch-reconnect {
+  font-size: .7rem;
+  padding: 0.2rem 0.5rem;
+  background: none;
+  border: 1px solid #c59030;
+  color: #e0b050;
+}
+.write-label {
   font-size: .75rem;
   color: var(--text-muted);
   font-family: var(--font);
   margin-right: 0.25rem;
 }
-.plant-field {
+.write-field {
   margin-bottom: 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
 }
-.plant-field input {
+.write-field input {
   width: 100%;
 }
-.plant-preview {
+.write-preview {
   font-size: .75rem;
   color: var(--text-muted);
   margin-bottom: 0.75rem;
   font-family: var(--font);
 }
-.plant-btn {
+.write-btn {
   background: var(--accent);
   color: var(--bg);
   font-weight: 600;
@@ -550,15 +584,15 @@ button:focus-visible {
   padding: 0.5rem 1.5rem;
   font-size: .85rem;
 }
-.plant-btn:hover { opacity: 0.85; }
-.plant-btn:disabled { opacity: 0.5; cursor: default; }
-.plant-status {
+.write-btn:hover { opacity: 0.85; }
+.write-btn:disabled { opacity: 0.5; cursor: default; }
+.write-status {
   margin-top: 0.75rem;
   font-size: .8rem;
   color: var(--green);
   font-family: var(--font);
 }
-.plant-view-btn {
+.write-view-btn {
   background: none;
   border: 1px solid var(--accent);
   color: var(--accent);

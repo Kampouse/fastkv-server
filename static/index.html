@@ -8,12 +8,12 @@
     <title>NEAR Garden</title>
     <meta
       name="description"
-      content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required."
+      content="Explore and write on-chain key-value data on NEAR Protocol. No API key required."
     />
     <meta property="og:title" content="NEAR Garden" />
     <meta
       property="og:description"
-      content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required."
+      content="Explore and write on-chain key-value data on NEAR Protocol. No API key required."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://fastdata.up.railway.app" />
@@ -21,7 +21,7 @@
     <meta name="twitter:title" content="NEAR Garden" />
     <meta
       name="twitter:description"
-      content="Explore and plant on-chain key-value data on NEAR Protocol. No API key required."
+      content="Explore and write on-chain key-value data on NEAR Protocol. No API key required."
     />
     <link rel="canonical" href="https://fastdata.up.railway.app" />
     <link
@@ -103,8 +103,8 @@
           tree
         </button>
         <button type="button" id="view-json" aria-pressed="false">json</button>
-        <button type="button" id="view-plant" aria-pressed="false" hidden>
-          plant
+        <button type="button" id="view-write" aria-pressed="false" hidden>
+          write
         </button>
       </div>
 
@@ -141,48 +141,60 @@
         <pre id="json-view"></pre>
       </div>
 
-      <!-- Plant panel -->
-      <div id="plant-panel" class="panel plant-panel" hidden>
-        <div class="plant-templates">
-          <span class="plant-label">templates</span>
-          <button type="button" onclick="applyTemplate('profile')">
-            profile
-          </button>
-          <button type="button" onclick="applyTemplate('post')">post</button>
-          <button type="button" onclick="applyTemplate('widget')">
-            widget
-          </button>
-          <button type="button" onclick="applyTemplate('raw')">raw</button>
+      <!-- Write panel -->
+      <div id="write-panel" class="panel write-panel" hidden>
+        <div class="write-header">
+          <span class="write-label">write to __fastdata_kv</span>
+          <button type="button" id="write-mode-toggle" class="write-mode-btn" onclick="toggleBatchMode()">batch</button>
         </div>
-        <div class="plant-field">
-          <label for="plant-key" class="plant-label">key path</label>
-          <input
-            id="plant-key"
-            type="text"
-            placeholder="recipes/carbonara"
-            spellcheck="false"
-            oninput="updatePlantPreview()"
-          />
+
+        <div id="write-single">
+          <div class="write-field">
+            <label for="write-key" class="write-label">key</label>
+            <input
+              id="write-key"
+              type="text"
+              placeholder="my/data/key"
+              spellcheck="false"
+              oninput="updateWritePreview()"
+            />
+          </div>
+          <div class="write-field">
+            <label for="write-value" class="write-label">value</label>
+            <textarea
+              id="write-value"
+              rows="6"
+              spellcheck="false"
+              placeholder="any string value"
+            ></textarea>
+          </div>
         </div>
-        <div class="plant-field">
-          <label for="plant-value" class="plant-label">value (JSON)</label>
-          <textarea
-            id="plant-value"
-            rows="8"
-            spellcheck="false"
-            placeholder='{ "ingredients": ["pasta", "eggs"] }'
-          ></textarea>
+
+        <div id="write-batch" hidden>
+          <div class="write-field">
+            <label for="write-batch-input" class="write-label">key-value pairs (JSON)</label>
+            <textarea
+              id="write-batch-input"
+              rows="10"
+              spellcheck="false"
+              placeholder='{"key1": "value1", "key2": "value2"}'
+              oninput="updateWritePreview()"
+            ></textarea>
+          </div>
         </div>
-        <div id="plant-preview" class="plant-preview"></div>
+
+        <div id="write-preview" class="write-preview"></div>
+        <div id="write-mismatch" class="write-mismatch" hidden></div>
+        <div class="write-note">wallet access key is scoped to the contract at sign-in time</div>
         <button
           type="button"
-          id="plant-btn"
-          class="plant-btn"
-          onclick="plantData()"
+          id="write-btn"
+          class="write-btn"
+          onclick="writeData()"
         >
-          plant_
+          write_
         </button>
-        <div id="plant-status" class="plant-status"></div>
+        <div id="write-status" class="write-status"></div>
       </div>
 
       <!-- Feed panel (timeline) -->
@@ -232,6 +244,7 @@
     <script src="/app.js"></script>
     <script src="/wallet.js"></script>
     <script>
+      if (!readHash()) explore('profile/**');
       initNear().catch((e) => console.warn("Wallet init failed:", e));
     </script>
   </body>

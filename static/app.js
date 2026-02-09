@@ -37,6 +37,98 @@ async function copyText(text, btn) {
   } catch { prompt('Copy:', text); }
 }
 
+// ── Hash state ─────────────────────────────────────────────
+
+let hashPushing = false;
+
+function buildHash() {
+  const p = new URLSearchParams();
+  if (viewMode === 'write') {
+    p.set('view', 'write');
+    p.set('contract', contractId);
+    const keyEl = document.getElementById('write-key');
+    if (keyEl && keyEl.value) p.set('key', keyEl.value);
+    const valEl = document.getElementById('write-value');
+    if (valEl && valEl.value) p.set('value', valEl.value);
+    if (writeBatchMode) p.set('batch', '1');
+  } else {
+    if (contractId !== 'contextual.near') p.set('contract', contractId);
+    if (currentAccount !== 'root.near') p.set('account', currentAccount);
+    const q = (queryInput.value || '').replace(/\/?\*+$/, '');
+    if (q) p.set('key', q);
+    if (viewMode !== 'tree') p.set('view', viewMode);
+    if (multiAccountMode) p.set('all', '1');
+  }
+  return p.toString();
+}
+
+function pushHash() {
+  const h = buildHash();
+  if (location.hash.slice(1) !== h) {
+    hashPushing = true;
+    location.hash = h || '';
+    hashPushing = false;
+  }
+}
+
+function readHash() {
+  const raw = location.hash.slice(1);
+  if (!raw) return false;
+  const p = new URLSearchParams(raw);
+
+  const c = p.get('contract');
+  if (c) { contractId = c; contractInput.value = c; }
+
+  const view = p.get('view') || 'tree';
+  const key = p.get('key') || '';
+
+  if (view === 'write') {
+    if (key) {
+      const keyEl = document.getElementById('write-key');
+      if (keyEl) keyEl.value = key;
+    }
+    const val = p.get('value');
+    if (val != null) {
+      const valEl = document.getElementById('write-value');
+      if (valEl) valEl.value = val;
+    }
+    if (p.get('batch') === '1' && typeof syncBatchUI === 'function') {
+      writeBatchMode = true;
+      syncBatchUI();
+    }
+    if (typeof updateWritePreview === 'function') updateWritePreview();
+    setViewMode('write');
+    return true;
+  }
+
+  const acct = p.get('account') || 'root.near';
+  currentAccount = acct;
+  accountInput.value = acct;
+
+  if (p.get('all') === '1') {
+    multiAccountMode = true;
+    if (allAccountsCheck) { allAccountsCheck.checked = true; }
+    accountInput.disabled = true;
+  }
+
+  if (key) {
+    queryInput.value = key + '/**';
+    breadcrumb = [currentAccount, ...key.split('/')];
+  } else {
+    queryInput.value = '';
+    breadcrumb = [currentAccount];
+  }
+
+  if (view === 'feed') {
+    setViewMode('feed');
+    loadFeed(currentAccount);
+  } else {
+    if (view === 'json') setViewMode('json');
+    explore(key ? key + '/**' : 'profile/**');
+  }
+  return true;
+}
+
 // ── API Inspector state ────────────────────────────────────
 
 let lastApiCall = null;
@@ -322,6 +414,8 @@ async function explore(keyPath) {
   // Switch to tree view to show results
   if (viewMode === 'feed') setViewMode('tree');
   else render();
+
+  pushHash();
 }
 
 function showError(msg) {
@@ -802,6 +896,7 @@ function setViewMode(mode) {
   viewJsonBtn.setAttribute('aria-pressed', mode === 'json');
   if (viewPlantBtn) viewPlantBtn.setAttribute('aria-pressed', mode === 'plant');
   render();
+  pushHash();
 }
 
 // ── Render ──────────────────────────────────────────────────
@@ -857,6 +952,7 @@ quickPaths.onclick = (e) => {
 
 contractInput.onchange = () => {
   contractId = contractInput.value;
+  pushHash();
 };
 
 accountInput.onchange = () => {
@@ -922,6 +1018,11 @@ if (diffBtn) {
 
 // ── Init ────────────────────────────────────────────────────
 
+window.addEventListener('hashchange', () => {
+  if (hashPushing) return;
+  readHash();
+});
+
 currentAccount = accountInput.value || 'root.near';
 breadcrumb = [currentAccount];
-explore('profile/**');
+// readHash() + explore() called from inline script after wallet.js loads
