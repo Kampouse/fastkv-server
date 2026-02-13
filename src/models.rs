@@ -56,8 +56,15 @@ pub struct ContractAccountRow {
     pub predecessor_id: String,
 }
 
+// Lightweight row for contract listing (current_account_id only)
+#[derive(DeserializeRow, Debug, Clone)]
+pub struct ContractRow {
+    pub current_account_id: String,
+}
+
 // API response
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct KvEntry {
     #[serde(rename = "accountId")]
     pub predecessor_id: String,
@@ -102,29 +109,29 @@ impl KvEntry {
             if field_set.contains("value") {
                 map.insert("value".to_string(), serde_json::json!(&self.value));
             }
-            if field_set.contains("block_height") {
+            if field_set.contains("blockHeight") {
                 map.insert(
-                    "block_height".to_string(),
+                    "blockHeight".to_string(),
                     serde_json::json!(self.block_height),
                 );
             }
-            if field_set.contains("block_timestamp") {
+            if field_set.contains("blockTimestamp") {
                 map.insert(
-                    "block_timestamp".to_string(),
+                    "blockTimestamp".to_string(),
                     serde_json::json!(self.block_timestamp),
                 );
             }
-            if field_set.contains("receipt_id") {
+            if field_set.contains("receiptId") {
                 map.insert(
-                    "receipt_id".to_string(),
+                    "receiptId".to_string(),
                     serde_json::json!(&self.receipt_id),
                 );
             }
-            if field_set.contains("tx_hash") {
-                map.insert("tx_hash".to_string(), serde_json::json!(&self.tx_hash));
+            if field_set.contains("txHash") {
+                map.insert("txHash".to_string(), serde_json::json!(&self.tx_hash));
             }
-            if field_set.contains("is_deleted") && self.is_deleted {
-                map.insert("is_deleted".to_string(), serde_json::json!(true));
+            if field_set.contains("isDeleted") && self.is_deleted {
+                map.insert("isDeleted".to_string(), serde_json::json!(true));
             }
 
             serde_json::Value::Object(map)
@@ -209,6 +216,9 @@ pub struct DataResponse<T: Serialize + utoipa::ToSchema> {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct TreeResponse {
     pub tree: serde_json::Value,
+    /// True when results were capped by the limit parameter.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_more: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -258,8 +268,7 @@ pub fn should_decode(value_format: &Option<String>) -> Result<bool, ApiError> {
         Some("json") => Ok(true),
         Some("raw") | None => Ok(false),
         Some(other) => Err(ApiError::InvalidParameter(format!(
-            "value_format must be 'json' or 'raw', got '{}'",
-            other
+            "value_format: must be 'json' or 'raw' (got '{other}')"
         ))),
     }
 }
@@ -267,7 +276,7 @@ pub fn should_decode(value_format: &Option<String>) -> Result<bool, ApiError> {
 pub fn validate_limit(limit: usize) -> Result<(), ApiError> {
     if limit == 0 || limit > 1000 {
         return Err(ApiError::InvalidParameter(
-            "limit must be between 1 and 1000".to_string(),
+            "limit: must be between 1 and 1000".to_string(),
         ));
     }
     Ok(())
@@ -282,7 +291,7 @@ pub struct QueryParams {
     #[serde(default)]
     pub key_prefix: Option<String>,
     #[serde(default)]
-    pub exclude_null: Option<bool>,
+    pub exclude_deleted: Option<bool>,
     #[serde(default = "default_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -312,7 +321,7 @@ pub struct WritersParams {
     #[serde(default)]
     pub predecessor_id: Option<String>,
     #[serde(default)]
-    pub exclude_null: Option<bool>,
+    pub exclude_deleted: Option<bool>,
     #[serde(default = "default_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -370,7 +379,7 @@ pub struct AccountsParams {
     pub current_account_id: String,
     pub key: String,
     #[serde(default)]
-    pub exclude_null: Option<bool>,
+    pub exclude_deleted: Option<bool>,
     #[serde(default = "default_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -403,6 +412,20 @@ pub struct AccountsQueryParams {
     /// use it for resumption, especially when truncated=true.
     #[serde(default)]
     pub after_account: Option<String>,
+}
+
+// Contracts listing query parameters
+#[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct ContractsQueryParams {
+    /// Optional: list contracts this account has written to (single-partition, cheap).
+    /// When omitted, lists all contracts globally (full scan, throttled).
+    #[serde(rename = "accountId", default)]
+    pub predecessor_id: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Cursor: return contracts after this value (TOKEN-ordered when global, lexicographic when per-account).
+    #[serde(default)]
+    pub after_contract: Option<String>,
 }
 
 // Diff query parameters
@@ -590,25 +613,16 @@ pub struct IndexEntry {
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct IndexResponse {
-    pub entries: Vec<IndexEntry>,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
 pub struct SocialFollowResponse {
-    pub accounts: Vec<String>,
+    pub data: Vec<String>,
     pub count: usize,
     pub meta: PaginationMeta,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct SocialFeedResponse {
-    pub posts: Vec<IndexEntry>,
-}
-
 // Error handling
+// Note: serde Serialize is unused — error_response() builds JSON manually via { "error": ... }.
+// The derive is kept for utoipa schema generation only.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-#[serde(tag = "type", content = "message")]
 pub enum ApiError {
     InvalidParameter(String),
     DatabaseError(String),
@@ -636,7 +650,11 @@ impl ResponseError for ApiError {
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         };
 
-        HttpResponse::build(status).json(serde_json::json!({
+        let mut response = HttpResponse::build(status);
+        if matches!(self, ApiError::TooManyRequests(_)) {
+            response.insert_header(("Retry-After", "1"));
+        }
+        response.json(serde_json::json!({
             "error": self.to_string()
         }))
     }
@@ -687,6 +705,7 @@ pub struct EdgesCountParams {
 }
 
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct EdgeSourceEntry {
     pub source: String,
     pub block_height: u64,
@@ -700,6 +719,7 @@ pub struct StatusResponse {
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct EdgesCountResponse {
     pub edge_type: String,
     pub target: String,
@@ -750,9 +770,9 @@ mod tests {
         let entry: KvEntry = row.into();
         assert!(entry.is_deleted);
 
-        // Verify is_deleted is serialized when true
+        // Verify isDeleted is serialized when true (camelCase)
         let json = serde_json::to_value(&entry).unwrap();
-        assert_eq!(json["is_deleted"], true);
+        assert_eq!(json["isDeleted"], true);
     }
 
     #[test]
@@ -771,9 +791,9 @@ mod tests {
         let entry: KvEntry = row.into();
         assert!(!entry.is_deleted);
 
-        // Verify is_deleted is omitted when false
+        // Verify isDeleted is omitted when false (camelCase)
         let json = serde_json::to_value(&entry).unwrap();
-        assert!(json.get("is_deleted").is_none());
+        assert!(json.get("isDeleted").is_none());
     }
 
     #[test]

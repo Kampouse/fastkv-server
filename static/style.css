@@ -129,12 +129,24 @@ main {
 .all-accounts-toggle {
   display: flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.35rem;
   font-size: .75rem;
-  color: var(--text-muted);
+  color: var(--text);
   cursor: pointer;
   white-space: nowrap;
   user-select: none;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  transition: border-color 0.15s, background 0.15s;
+}
+.all-accounts-toggle:hover {
+  border-color: var(--accent);
+}
+.all-accounts-toggle:has(input:checked) {
+  border-color: var(--accent);
+  background: rgba(50, 231, 140, 0.1);
 }
 .all-accounts-toggle input[type="checkbox"] {
   width: auto;
@@ -204,15 +216,14 @@ button:focus-visible {
 #explore-btn:hover { opacity: 0.85; }
 #explore-btn:disabled { opacity: 0.5; cursor: default; }
 
-/* Quick paths */
-.quick-paths {
-  display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-}
-.quick-paths button {
+.tree-truncated {
+  color: var(--text-muted);
   font-size: .75rem;
-  padding: 0.3rem 0.6rem;
+  font-family: var(--font);
+  font-style: italic;
+  padding: 0.5rem;
+  border-top: 1px solid var(--border);
+  margin-top: 0.5rem;
 }
 
 /* Breadcrumb */
@@ -261,12 +272,14 @@ button:focus-visible {
   border-radius: var(--radius);
   padding: 0.75rem 1rem;
   margin-bottom: 0.75rem;
-  display: flex;
   align-items: center;
   justify-content: space-between;
   font-size: .85rem;
   color: var(--danger);
   font-family: var(--font);
+}
+.error-bar:not([hidden]) {
+  display: flex;
 }
 #retry-btn {
   font-size: .75rem;
@@ -275,8 +288,10 @@ button:focus-visible {
 
 /* Content area */
 .content {
-  display: flex;
   gap: 1rem;
+}
+.content:not([hidden]) {
+  display: flex;
 }
 .panel {
   background: var(--bg-card);
@@ -288,14 +303,6 @@ button:focus-visible {
 }
 .tree-panel { flex: 1; min-width: 0; }
 .detail-panel { width: 360px; flex-shrink: 0; }
-.json-panel {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 1rem;
-  overflow: auto;
-  max-height: 600px;
-}
 #json-view {
   color: var(--text-secondary);
   font-size: .85rem;
@@ -350,16 +357,26 @@ button:focus-visible {
 }
 .tree-children { margin-left: 1.25rem; }
 .tree-empty {
-  margin-left: 2.1rem;
   color: var(--text-muted);
-  font-size: .75rem;
-  font-style: italic;
+  font-size: .8rem;
   font-family: var(--font);
+  padding: 1.5rem;
+  line-height: 1.6;
+}
+.tree-empty .empty-heading {
+  color: var(--text-secondary);
+  font-size: .85rem;
+  margin-bottom: 0.75rem;
+}
+.tree-empty .empty-detail {
+  font-size: .75rem;
+  margin-bottom: 0.5rem;
 }
 .tree-loading {
   color: var(--text-muted);
   font-size: .85rem;
   font-family: var(--font);
+  padding: 1.5rem;
 }
 
 /* Detail panel */
@@ -510,6 +527,21 @@ button:focus-visible {
 .write-panel {
   max-height: none;
 }
+.write-connect-prompt {
+  text-align: center;
+  padding: 2rem 1rem;
+  color: var(--text-muted);
+  font-size: .85rem;
+}
+.write-connect-prompt button {
+  margin-top: 0.75rem;
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+  border: none;
+  padding: 0.5rem 1.2rem;
+}
+.write-connect-prompt button:hover { opacity: 0.85; }
 .write-header {
   display: flex;
   align-items: center;
@@ -533,27 +565,6 @@ button:focus-visible {
   font-family: var(--font);
   font-style: italic;
   margin-bottom: 0.75rem;
-}
-.write-mismatch {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  padding: 0.5rem 0.75rem;
-  margin-bottom: 0.75rem;
-  border: 1px solid #c59030;
-  border-radius: var(--radius);
-  background: rgba(197, 144, 48, 0.08);
-  font-size: .75rem;
-  color: #e0b050;
-  font-family: var(--font);
-}
-.mismatch-reconnect {
-  font-size: .7rem;
-  padding: 0.2rem 0.5rem;
-  background: none;
-  border: 1px solid #c59030;
-  color: #e0b050;
 }
 .write-label {
   font-size: .75rem;
@@ -720,7 +731,6 @@ footer a:hover { text-decoration: underline; }
   .history-panel { width: 100%; }
   .tree-preview { max-width: 150px; }
   .search-row { flex-wrap: wrap; }
-  .all-accounts-toggle { order: 4; }
 }
 @media (max-width: 400px) {
   .logo { font-size: 1.3rem; }

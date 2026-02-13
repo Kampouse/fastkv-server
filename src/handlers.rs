@@ -69,14 +69,12 @@ fn respond_paginated(
 pub(crate) fn validate_account_id(value: &str, name: &str) -> Result<(), ApiError> {
     if value.is_empty() {
         return Err(ApiError::InvalidParameter(format!(
-            "{} cannot be empty",
-            name
+            "{name}: cannot be empty"
         )));
     }
     if value.len() > MAX_ACCOUNT_ID_LENGTH {
         return Err(ApiError::InvalidParameter(format!(
-            "{} cannot exceed {} characters",
-            name, MAX_ACCOUNT_ID_LENGTH
+            "{name}: cannot exceed {MAX_ACCOUNT_ID_LENGTH} characters"
         )));
     }
     Ok(())
@@ -85,14 +83,12 @@ pub(crate) fn validate_account_id(value: &str, name: &str) -> Result<(), ApiErro
 pub(crate) fn validate_key(value: &str, name: &str, max_len: usize) -> Result<(), ApiError> {
     if value.is_empty() {
         return Err(ApiError::InvalidParameter(format!(
-            "{} cannot be empty",
-            name
+            "{name}: cannot be empty"
         )));
     }
     if value.len() > max_len {
         return Err(ApiError::InvalidParameter(format!(
-            "{} cannot exceed {} characters",
-            name, max_len
+            "{name}: cannot exceed {max_len} characters"
         )));
     }
     Ok(())
@@ -101,8 +97,7 @@ pub(crate) fn validate_key(value: &str, name: &str, max_len: usize) -> Result<()
 pub(crate) fn validate_offset(offset: usize) -> Result<(), ApiError> {
     if offset > MAX_OFFSET {
         return Err(ApiError::InvalidParameter(format!(
-            "offset cannot exceed {}",
-            MAX_OFFSET
+            "offset: cannot exceed {MAX_OFFSET}"
         )));
     }
     Ok(())
@@ -118,8 +113,7 @@ pub(crate) fn validate_cursor_or_offset(
         validate_cursor_fn(c, cursor_name)?;
         if offset > 0 {
             return Err(ApiError::InvalidParameter(format!(
-                "cannot use both '{}' cursor and 'offset'",
-                cursor_name
+                "{cursor_name}: cannot combine with offset"
             )));
         }
     } else {
@@ -131,7 +125,7 @@ pub(crate) fn validate_cursor_or_offset(
 pub(crate) fn validate_order(order: &str) -> Result<(), ApiError> {
     if !order.eq_ignore_ascii_case("asc") && !order.eq_ignore_ascii_case("desc") {
         return Err(ApiError::InvalidParameter(
-            "order must be 'asc' or 'desc'".to_string(),
+            "order: must be 'asc' or 'desc'".to_string(),
         ));
     }
     Ok(())
@@ -140,13 +134,13 @@ pub(crate) fn validate_order(order: &str) -> Result<(), ApiError> {
 fn validate_block_range(from_block: Option<i64>, to_block: Option<i64>) -> Result<(), ApiError> {
     if from_block.is_some_and(|v| v < 0) || to_block.is_some_and(|v| v < 0) {
         return Err(ApiError::InvalidParameter(
-            "block heights cannot be negative".to_string(),
+            "from_block/to_block: cannot be negative".to_string(),
         ));
     }
     if let (Some(from), Some(to)) = (from_block, to_block) {
         if from > to {
             return Err(ApiError::InvalidParameter(
-                "from_block must be less than or equal to to_block".to_string(),
+                "from_block: must be <= to_block".to_string(),
             ));
         }
     }
@@ -157,16 +151,57 @@ fn validate_prefix(prefix: &Option<String>) -> Result<(), ApiError> {
     if let Some(ref p) = prefix {
         if p.is_empty() {
             return Err(ApiError::InvalidParameter(
-                "key_prefix cannot be empty string (omit parameter if not filtering)".to_string(),
+                "key_prefix: cannot be empty (omit to skip filtering)".to_string(),
             ));
         }
         if p.len() > MAX_PREFIX_LENGTH {
             return Err(ApiError::InvalidParameter(format!(
-                "key_prefix cannot exceed {} characters",
-                MAX_PREFIX_LENGTH
+                "key_prefix: cannot exceed {MAX_PREFIX_LENGTH} characters"
             )));
         }
     }
+    Ok(())
+}
+
+fn extract_client_ip(req: &HttpRequest) -> String {
+    req.headers()
+        .get("X-Forwarded-For")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "unknown")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            req.connection_info()
+                .realip_remote_addr()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            req.connection_info()
+                .peer_addr()
+                .unwrap_or("unknown")
+                .to_string()
+        })
+}
+
+fn check_scan_throttle(app_state: &AppState, ip: &str) -> Result<(), ApiError> {
+    let mut throttle = app_state
+        .scan_throttle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if throttle.len() > THROTTLE_CLEANUP_THRESHOLD {
+        let cutoff = now - THROTTLE_EXPIRY;
+        throttle.retain(|_, ts| *ts > cutoff);
+    }
+    if let Some(last) = throttle.get(ip) {
+        if now.duration_since(*last) < std::time::Duration::from_secs(1) {
+            return Err(ApiError::TooManyRequests(
+                "Too many scan requests. Try again shortly.".to_string(),
+            ));
+        }
+    }
+    throttle.insert(ip.to_string(), now);
     Ok(())
 }
 
@@ -211,7 +246,8 @@ pub async fn health_check(app_state: web::Data<AppState>) -> Result<HttpResponse
     params(GetParams),
     responses(
         (status = 200, description = "Entry found or null if not found", body = inline(DataResponse<Option<KvEntry>>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -265,7 +301,8 @@ pub async fn get_kv_handler(
     params(QueryParams),
     responses(
         (status = 200, description = "List of matching entries", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -289,7 +326,7 @@ pub async fn query_kv_handler(
     if let Some(ref fmt) = query.format {
         if fmt != "tree" {
             return Err(ApiError::InvalidParameter(
-                "format must be 'tree' or omitted".to_string(),
+                "format: must be 'tree' or omitted".to_string(),
             ));
         }
     }
@@ -311,7 +348,7 @@ pub async fn query_kv_handler(
     if query.format.as_deref() == Some("tree") {
         let items: Vec<(String, String)> = entries.into_iter().map(|e| (e.key, e.value)).collect();
         let tree = build_tree(&items);
-        return Ok(HttpResponse::Ok().json(TreeResponse { tree }));
+        return Ok(HttpResponse::Ok().json(TreeResponse { tree, has_more }));
     }
 
     let next_cursor = entries.last().map(|e| e.key.clone());
@@ -336,7 +373,8 @@ pub async fn query_kv_handler(
     params(HistoryParams),
     responses(
         (status = 200, description = "List of historical entries", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -387,7 +425,8 @@ pub async fn history_kv_handler(
     params(WritersParams),
     responses(
         (status = 200, description = "List of entries from writers", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -470,17 +509,17 @@ pub async fn accounts_handler(
         // Full table scan: require explicit opt-in
         if query.scan != Some(1) {
             return Err(ApiError::InvalidParameter(
-                "contractId is optional but requires scan=1 (expensive).".to_string(),
+                "contractId: required unless scan=1".to_string(),
             ));
         }
         if query.key.is_some() {
             return Err(ApiError::InvalidParameter(
-                "key filter requires contractId".to_string(),
+                "key: requires contractId".to_string(),
             ));
         }
         if query.offset > 0 {
             return Err(ApiError::InvalidParameter(
-                "offset not supported without contractId; use after_account cursor".to_string(),
+                "offset: requires contractId (use after_account cursor instead)".to_string(),
             ));
         }
     } else if let Some(cid) = contract_id {
@@ -505,46 +544,8 @@ pub async fn accounts_handler(
         validate_account_id,
     )?;
 
-    // Per-IP throttle for scan requests.
-    // Relies on a trusted reverse proxy (e.g. Railway) to set X-Forwarded-For;
-    // without one, clients can spoof the header to bypass the throttle.
     if is_scan {
-        let ip = req
-            .headers()
-            .get("X-Forwarded-For")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty() && *s != "unknown")
-            .map(|s| s.to_string())
-            .or_else(|| {
-                req.connection_info()
-                    .realip_remote_addr()
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| {
-                req.connection_info()
-                    .peer_addr()
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
-        let mut throttle = app_state
-            .scan_throttle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let now = std::time::Instant::now();
-        if throttle.len() > THROTTLE_CLEANUP_THRESHOLD {
-            let cutoff = now - THROTTLE_EXPIRY;
-            throttle.retain(|_, ts| *ts > cutoff);
-        }
-        if let Some(last) = throttle.get(&ip) {
-            if now.duration_since(*last) < std::time::Duration::from_secs(1) {
-                return Err(ApiError::TooManyRequests(
-                    "Too many scan requests. Try again shortly.".to_string(),
-                ));
-            }
-        }
-        throttle.insert(ip, now);
+        check_scan_throttle(&app_state, &extract_client_ip(&req))?;
     }
 
     tracing::info!(
@@ -590,6 +591,76 @@ pub async fn accounts_handler(
     }))
 }
 
+/// List all distinct contract IDs
+#[utoipa::path(
+    get,
+    path = "/v1/kv/contracts",
+    params(ContractsQueryParams),
+    responses(
+        (status = 200, description = "List of contract IDs", body = inline(PaginatedResponse<String>)),
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 429, description = "Too many requests", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
+    ),
+    tag = "kv"
+)]
+#[get("/v1/kv/contracts")]
+pub async fn contracts_handler(
+    req: HttpRequest,
+    query: web::Query<ContractsQueryParams>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, ApiError> {
+    let limit = query.limit.min(MAX_SCAN_LIMIT);
+    validate_limit(limit)?;
+
+    if let Some(ref cursor) = query.after_contract {
+        validate_account_id(cursor, "after_contract")?;
+    }
+
+    let db = require_db(&app_state).await?;
+
+    let (contracts, has_more, dropped) = if let Some(ref account_id) = query.predecessor_id {
+        // Per-account query: cheap single-partition lookup, no throttle needed
+        validate_account_id(account_id, "accountId")?;
+
+        tracing::info!(
+            target: PROJECT_ID,
+            account_id = account_id,
+            limit = limit,
+            after_contract = ?query.after_contract,
+            "GET /v1/kv/contracts (by account)"
+        );
+
+        db.query_contracts_by_account(account_id, limit, query.after_contract.as_deref())
+            .await?
+    } else {
+        check_scan_throttle(&app_state, &extract_client_ip(&req))?;
+
+        tracing::info!(
+            target: PROJECT_ID,
+            limit = limit,
+            after_contract = ?query.after_contract,
+            "GET /v1/kv/contracts"
+        );
+
+        db.query_all_contracts(limit, query.after_contract.as_deref())
+            .await?
+    };
+
+    let next_cursor = contracts.last().cloned();
+    let meta = PaginationMeta {
+        has_more,
+        truncated: false,
+        next_cursor,
+        dropped_rows: dropped_to_option(dropped),
+    };
+
+    Ok(HttpResponse::Ok().json(PaginatedResponse {
+        data: contracts,
+        meta,
+    }))
+}
+
 /// Compare a key's value at two different block heights
 #[utoipa::path(
     get,
@@ -597,7 +668,8 @@ pub async fn accounts_handler(
     params(DiffParams),
     responses(
         (status = 200, description = "Values at both block heights", body = inline(DataResponse<DiffResponse>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -611,7 +683,7 @@ pub async fn diff_kv_handler(
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     if query.block_height_a < 0 || query.block_height_b < 0 {
         return Err(ApiError::InvalidParameter(
-            "block_height_a and block_height_b must be non-negative".to_string(),
+            "block_height_a/block_height_b: must be non-negative".to_string(),
         ));
     }
 
@@ -673,7 +745,8 @@ pub async fn diff_kv_handler(
     params(TimelineParams),
     responses(
         (status = 200, description = "Chronological list of all writes", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -724,7 +797,8 @@ pub async fn timeline_kv_handler(
     request_body = BatchQuery,
     responses(
         (status = 200, description = "Batch results", body = inline(DataResponse<Vec<BatchResultItem>>)),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "kv"
 )]
@@ -737,25 +811,23 @@ pub async fn batch_kv_handler(
     validate_account_id(&body.current_account_id, "contractId")?;
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "keys cannot be empty".to_string(),
+            "keys: cannot be empty".to_string(),
         ));
     }
     if body.keys.len() > MAX_BATCH_KEYS {
         return Err(ApiError::InvalidParameter(format!(
-            "keys cannot exceed {} items",
-            MAX_BATCH_KEYS
+            "keys: cannot exceed {MAX_BATCH_KEYS} items"
         )));
     }
     for key in &body.keys {
         if key.is_empty() {
             return Err(ApiError::InvalidParameter(
-                "key in batch cannot be empty".to_string(),
+                "keys[]: cannot be empty".to_string(),
             ));
         }
         if key.len() > MAX_BATCH_KEY_LENGTH {
             return Err(ApiError::InvalidParameter(format!(
-                "each key cannot exceed {} characters",
-                MAX_BATCH_KEY_LENGTH
+                "keys[]: cannot exceed {MAX_BATCH_KEY_LENGTH} characters"
             )));
         }
     }

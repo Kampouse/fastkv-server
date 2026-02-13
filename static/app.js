@@ -52,12 +52,13 @@ function buildHash() {
     if (valEl && valEl.value) p.set('value', valEl.value);
     if (writeBatchMode) p.set('batch', '1');
   } else {
-    if (contractId !== 'contextual.near') p.set('contract', contractId);
-    if (currentAccount !== 'root.near') p.set('account', currentAccount);
+    if (contractId) p.set('contract', contractId);
+    if (currentAccount) p.set('account', currentAccount);
     const q = (queryInput.value || '').replace(/\/?\*+$/, '');
     if (q) p.set('key', q);
     if (viewMode !== 'tree') p.set('view', viewMode);
-    if (multiAccountMode) p.set('all', '1');
+    if (allContractsCheck && allContractsCheck.checked) p.set('allContracts', '1');
+    if (multiAccountMode) p.set('allAccounts', '1');
   }
   return p.toString();
 }
@@ -77,7 +78,18 @@ function readHash() {
   const p = new URLSearchParams(raw);
 
   const c = p.get('contract');
-  if (c) { contractId = c; contractInput.value = c; }
+  const isAllContracts = p.get('allContracts') === '1' || !c;
+  if (isAllContracts) {
+    contractId = '';
+    contractInput.value = '';
+    contractInput.disabled = true;
+    if (allContractsCheck) allContractsCheck.checked = true;
+  } else {
+    contractId = c;
+    contractInput.value = c;
+    contractInput.disabled = false;
+    if (allContractsCheck) allContractsCheck.checked = false;
+  }
 
   const view = p.get('view') || 'tree';
   const key = p.get('key') || '';
@@ -101,22 +113,29 @@ function readHash() {
     return true;
   }
 
-  const acct = p.get('account') || 'root.near';
-  currentAccount = acct;
-  accountInput.value = acct;
+  const acct = p.get('account') || '';
+  const isAllAccounts = p.get('allAccounts') === '1' || (!acct && !p.has('account'));
 
-  if (p.get('all') === '1') {
+  if (isAllAccounts) {
     multiAccountMode = true;
-    if (allAccountsCheck) { allAccountsCheck.checked = true; }
+    currentAccount = '';
+    accountInput.value = '';
     accountInput.disabled = true;
+    if (allAccountsCheck) allAccountsCheck.checked = true;
+  } else {
+    multiAccountMode = false;
+    currentAccount = acct;
+    accountInput.value = acct;
+    accountInput.disabled = false;
+    if (allAccountsCheck) allAccountsCheck.checked = false;
   }
 
   if (key) {
     queryInput.value = key + '/**';
-    breadcrumb = [currentAccount, ...key.split('/')];
+    breadcrumb = currentAccount ? [currentAccount, ...key.split('/')] : key.split('/');
   } else {
     queryInput.value = '';
-    breadcrumb = [currentAccount];
+    breadcrumb = currentAccount ? [currentAccount] : [];
   }
 
   if (view === 'feed') {
@@ -124,7 +143,7 @@ function readHash() {
     loadFeed(currentAccount);
   } else {
     if (view === 'json') setViewMode('json');
-    explore(key ? key + '/**' : 'profile/**');
+    explore(key ? key + '/**' : '');
   }
   return true;
 }
@@ -142,6 +161,7 @@ function renderInspector() {
   const inspector = document.getElementById('api-inspector');
   const summary = document.getElementById('inspector-summary');
   const detail = document.getElementById('inspector-body');
+  const toggle = document.getElementById('inspector-detail');
   if (!inspector || !lastApiCall) return;
 
   inspector.hidden = false;
@@ -149,17 +169,23 @@ function renderInspector() {
   const path = url.replace(window.location.origin, '');
   summary.textContent = `${method} ${path} — ${status}`;
 
-  let bodyStr = '';
+  const arrow = document.getElementById('inspector-arrow');
   if (method === 'POST' && body) {
-    bodyStr = `\n${JSON.stringify(body, null, 2)}`;
+    detail.textContent = JSON.stringify(body, null, 2);
+    if (toggle) toggle.hidden = false;
+    if (arrow) arrow.hidden = false;
+  } else {
+    detail.textContent = '';
+    if (toggle) toggle.hidden = true;
+    if (arrow) { arrow.hidden = true; arrow.classList.remove('open'); }
   }
-  detail.textContent = `${method} ${path}${bodyStr}`;
 }
 
 function toggleInspector() {
   const detail = document.getElementById('inspector-detail');
   const arrow = document.getElementById('inspector-arrow');
-  if (!detail) return;
+  const body = document.getElementById('inspector-body');
+  if (!detail || !body || !body.textContent) return;
   const open = detail.hidden;
   detail.hidden = !open;
   arrow.classList.toggle('open', open);
@@ -178,6 +204,19 @@ function copyAsCurl() {
 }
 
 // ── API Client ──────────────────────────────────────────────
+
+async function kvContracts(opts) {
+  const params = {};
+  if (opts?.accountId) params.accountId = opts.accountId;
+  if (opts?.limit) params.limit = String(opts.limit);
+  if (opts?.after_contract) params.after_contract = opts.after_contract;
+  const url = buildUrl('/v1/kv/contracts', params);
+  const res = await fetch(url);
+  logApiCall('GET', url, null, res.status);
+  if (!res.ok) throw new Error(`kvContracts: ${res.status}`);
+  const json = await res.json();
+  return { contracts: json.data || [], meta: json.meta || {} };
+}
 
 async function kvAccounts(contractId, opts) {
   const params = { contractId };
@@ -205,7 +244,7 @@ async function kvGet(accountId, contractId, key) {
 async function kvTimeline(accountId, contractId, limit) {
   const params = new URLSearchParams({
     accountId,
-    contractId: contractId || 'contextual.near',
+    contractId,
     limit: String(limit || 20),
     value_format: 'json',
   });
@@ -267,7 +306,8 @@ async function kvQueryTree(accountId, contractId, keyPrefix) {
     accountId, contractId,
     format: 'tree',
     value_format: 'json',
-    exclude_null: 'true',
+    exclude_deleted: 'true',
+    limit: '1000',
   });
   if (keyPrefix) params.set('key_prefix', keyPrefix);
   const url = `${API}/v1/kv/query?${params}`;
@@ -275,19 +315,23 @@ async function kvQueryTree(accountId, contractId, keyPrefix) {
   logApiCall('GET', url, null, res.status);
   if (!res.ok) throw new Error(`kvQueryTree: ${res.status}`);
   const json = await res.json();
-  return json.tree ?? json.data ?? null;
+  const tree = json.tree ?? json.data ?? null;
+  if (json.has_more) lastTreeTruncated = true;
+  return tree;
 }
 
 // ── State ───────────────────────────────────────────────────
 
-let currentAccount = 'root.near';
-let contractId = 'contextual.near';
-let viewMode = 'tree'; // 'tree' | 'json' | 'plant' | 'feed'
+let currentAccount = '';
+let contractId = '';
+let viewMode = 'tree'; // 'tree' | 'json' | 'write' | 'feed'
 let treeData = null;
+let lastKeyPrefix = undefined;
+let lastTreeTruncated = false;
 let rawData = null;
-let breadcrumb = ['root.near'];
+let breadcrumb = [];
 let loading = false;
-let multiAccountMode = false; // for cross-account tree grouping
+let multiAccountMode = true;
 let currentSelectedPath = null;
 let currentHistoryEntries = [];
 
@@ -299,11 +343,9 @@ const accountInput = $('#account-input');
 const queryInput = $('#query-input');
 const exploreBtn = $('#explore-btn');
 const exploreForm = $('#explore-form');
-const quickPaths = $('#quick-paths');
 const breadcrumbEl = $('#breadcrumb');
 const viewTreeBtn = $('#view-tree');
 const viewJsonBtn = $('#view-json');
-const viewPlantBtn = $('#view-plant');
 const errorBar = $('#error-bar');
 const errorMsg = $('#error-msg');
 const retryBtn = $('#retry-btn');
@@ -316,9 +358,9 @@ const detailValue = $('#detail-value');
 const detailMeta = $('#detail-meta');
 const jsonPanel = $('#json-panel');
 const jsonView = $('#json-view');
-const plantPanel = $('#plant-panel');
 const feedPanel = $('#feed-panel');
 const feedList = $('#feed-list');
+const allContractsCheck = $('#all-contracts-check');
 const allAccountsCheck = $('#all-accounts-check');
 const historyPanel = $('#history-panel');
 const historyList = $('#history-list');
@@ -331,74 +373,81 @@ const diffCopyBar = $('#diff-copy-bar');
 // ── Explorer ────────────────────────────────────────────────
 
 const MULTI_ACCOUNT_CAP = 200;
-const MULTI_ACCOUNT_CONCURRENCY = 5;
 
 async function explore(keyPath) {
-  currentAccount = accountInput.value || 'root.near';
-  contractId = contractInput.value || 'contextual.near';
-  multiAccountMode = allAccountsCheck && allAccountsCheck.checked;
-
-  const keyPrefix = (keyPath || queryInput.value || 'profile/**').replace(/\/?\*+$/, '') || undefined;
+  const allContracts = allContractsCheck && allContractsCheck.checked;
+  contractId = allContracts ? '' : contractInput.value.trim();
 
   loading = true;
   exploreBtn.disabled = true;
   exploreBtn.textContent = '...';
   hideError();
   hideDetail();
+  treeEl.innerHTML = '<div class="tree-loading">loading...</div>';
+
+  if (allContracts) {
+    // Contract discovery mode: list all contracts (or contracts for a specific account)
+    const acct = accountInput.value.trim();
+    try {
+      const opts = { limit: MULTI_ACCOUNT_CAP };
+      if (acct) opts.accountId = acct;
+      const { contracts } = await kvContracts(opts);
+      if (contracts.length === 0) {
+        treeData = null;
+        rawData = null;
+      } else {
+        const placeholder = {};
+        contracts.forEach(c => { placeholder[c] = {}; });
+        treeData = placeholder;
+        rawData = placeholder;
+      }
+    } catch (e) {
+      showError('Failed to fetch contracts');
+      console.error(e);
+      treeData = null;
+      rawData = null;
+    }
+    loading = false;
+    exploreBtn.disabled = false;
+    exploreBtn.textContent = 'explore_';
+    render();
+    pushHash();
+    return;
+  }
+
+  multiAccountMode = allAccountsCheck && allAccountsCheck.checked;
+  currentAccount = multiAccountMode ? '' : (accountInput.value.trim() || '');
+
+  const keyPrefix = (keyPath || queryInput.value || '').replace(/\/?\*+$/, '') || undefined;
+  lastKeyPrefix = keyPrefix;
+  lastTreeTruncated = false;
 
   try {
-    if (!multiAccountMode) {
-      // ── Single-account: KV only, no fallback ──
+    if (!multiAccountMode && currentAccount) {
+      // ── Single-account: KV only ──
       const tree = await kvQueryTree(currentAccount, contractId, keyPrefix);
       if (tree && Object.keys(tree).length > 0) {
         treeData = { [currentAccount]: tree };
         rawData = treeData;
       } else {
-        showError('No data (KV)');
         treeData = null;
         rawData = null;
       }
     } else {
-      // ── Cross-account: /v1/kv/accounts → parallel KV queries ──
+      // ── All accounts: fetch account list, lazy-load data on expand ──
       const { accounts } = await kvAccounts(contractId, { limit: MULTI_ACCOUNT_CAP });
       if (accounts.length === 0) {
         showError('No accounts found for this contract');
         treeData = null;
         rawData = null;
       } else {
-        const merged = {};
-        const truncated = accounts.length >= MULTI_ACCOUNT_CAP;
-
-        // Parallel fetch with concurrency limit
-        const queue = [...accounts];
-        const inflight = [];
-        while (queue.length > 0 || inflight.length > 0) {
-          while (inflight.length < MULTI_ACCOUNT_CONCURRENCY && queue.length > 0) {
-            const acct = queue.shift();
-            const p = kvQueryTree(acct, contractId, keyPrefix)
-              .then(tree => { if (tree && Object.keys(tree).length > 0) merged[acct] = tree; })
-              .catch(err => console.warn(`kvQueryTree failed for ${acct}:`, err));
-            p._done = false;
-            p.finally(() => { p._done = true; });
-            inflight.push(p);
-          }
-          await Promise.race(inflight);
-          // Remove settled promises
-          for (let i = inflight.length - 1; i >= 0; i--) {
-            if (inflight[i]._done) inflight.splice(i, 1);
-          }
-        }
-
-        if (Object.keys(merged).length === 0) {
-          showError('No data (KV)');
-          treeData = null;
-          rawData = null;
-        } else {
-          treeData = merged;
-          rawData = merged;
-          if (truncated) {
-            showError(`Showing first ${MULTI_ACCOUNT_CAP} accounts — more may exist`);
-          }
+        // Create placeholder entries — tree data loads on expand
+        const placeholder = {};
+        accounts.forEach(acct => { placeholder[acct] = {}; });
+        treeData = placeholder;
+        rawData = placeholder;
+        if (accounts.length >= MULTI_ACCOUNT_CAP) {
+          showError(`Showing first ${MULTI_ACCOUNT_CAP} accounts — more may exist`);
         }
       }
     }
@@ -435,10 +484,10 @@ function renderBreadcrumb() {
   const root = document.createElement('button');
   root.textContent = '~';
   root.type = 'button';
-  root.onclick = () => navigateBreadcrumb(breadcrumb.slice(0, 1));
+  root.onclick = () => navigateBreadcrumb([]);
   breadcrumbEl.appendChild(root);
 
-  breadcrumb.forEach((seg, i) => {
+  breadcrumb.filter(Boolean).forEach((seg, i) => {
     const sep = document.createElement('span');
     sep.className = 'sep';
     sep.textContent = '/';
@@ -460,43 +509,91 @@ function renderBreadcrumb() {
 }
 
 function navigateBreadcrumb(segments) {
-  setAccount(segments[0]);
-  if (segments.length === 1) {
+  if (segments.length === 0) {
     queryInput.value = '';
-    breadcrumb = [currentAccount];
-    explore('profile/**');
+    breadcrumb = [];
+    explore();
   } else {
-    const keyPath = segments.slice(1).join('/');
-    queryInput.value = `${keyPath}/**`;
-    breadcrumb = segments;
-    explore(`${keyPath}/**`);
+    setAccount(segments[0]);
+    if (segments.length === 1) {
+      queryInput.value = '';
+      breadcrumb = [currentAccount];
+      explore();
+    } else {
+      const keyPath = segments.slice(1).join('/');
+      queryInput.value = `${keyPath}/**`;
+      breadcrumb = segments;
+      explore(`${keyPath}/**`);
+    }
   }
 }
 
 // ── Tree rendering ──────────────────────────────────────────
 
+function renderEmptyState() {
+  const prefix = lastKeyPrefix;
+  const el = document.createElement('div');
+  el.className = 'tree-empty';
+
+  let heading = '';
+  let detail = '';
+  if (!contractId) {
+    const acct = accountInput.value.trim();
+    heading = acct ? `No contracts found for ${esc(acct)}` : 'No contracts found';
+  } else if (prefix) {
+    heading = `No entries under "${esc(prefix)}/"`;
+    detail = currentAccount
+      ? `for ${esc(currentAccount)} on ${esc(contractId)}`
+      : `on ${esc(contractId)}`;
+  } else {
+    heading = 'No data found';
+    detail = currentAccount
+      ? `${esc(currentAccount)} has no entries on ${esc(contractId)}`
+      : `no entries on ${esc(contractId)}`;
+  }
+
+  let html = `<div class="empty-heading">${heading}</div>`;
+  if (detail) html += `<div class="empty-detail">${detail}</div>`;
+
+  el.innerHTML = html;
+  treeEl.appendChild(el);
+}
+
 function renderTree() {
   treeEl.innerHTML = '';
 
   if (loading && !treeData) {
-    treeEl.innerHTML = '<div class="tree-loading">loading_</div>';
+    treeEl.innerHTML = '<div class="tree-loading">loading...</div>';
     return;
   }
 
   if (!treeData) {
-    treeEl.innerHTML = '<div class="tree-empty">no data</div>';
+    renderEmptyState();
+    return;
+  }
+
+  if (!contractId) {
+    // Contract discovery mode: show contracts as expandable nodes
+    const contracts = Object.keys(treeData);
+    if (contracts.length === 0) {
+      renderEmptyState();
+      return;
+    }
+    contracts.forEach(c => {
+      treeEl.appendChild(createContractNode(c));
+    });
     return;
   }
 
   if (multiAccountMode) {
-    // Cross-account mode: show accounts as top-level nodes
+    // All-accounts mode: show accounts as expandable nodes (lazy-loaded)
     const accounts = Object.entries(treeData);
     if (accounts.length === 0) {
-      treeEl.innerHTML = '<div class="tree-empty">no data</div>';
+      renderEmptyState();
       return;
     }
     accounts.forEach(([acct, val]) => {
-      treeEl.appendChild(createTreeNode(acct, val, acct, 0));
+      treeEl.appendChild(createTreeNode(acct, val, '', 0, acct));
     });
     return;
   }
@@ -509,16 +606,23 @@ function renderTree() {
   );
 
   if (entries.length === 0) {
-    treeEl.innerHTML = '<div class="tree-empty">no data</div>';
+    renderEmptyState();
     return;
   }
 
   entries.forEach(([key, val]) => {
     treeEl.appendChild(createTreeNode(key, val, key, 0));
   });
+
+  if (lastTreeTruncated) {
+    const note = document.createElement('div');
+    note.className = 'tree-truncated';
+    note.textContent = 'Results truncated — narrow your query or use the API for full results';
+    treeEl.appendChild(note);
+  }
 }
 
-function createTreeNode(name, value, path, depth) {
+function createTreeNode(name, value, path, depth, accountOverride, contractOverride) {
   const container = document.createElement('div');
   const isBranch = typeof value === 'object' && value !== null;
   const isNearAccount = name.endsWith('.near') || name.endsWith('.tg');
@@ -586,7 +690,7 @@ function createTreeNode(name, value, path, depth) {
   async function loadChildren() {
     icon.textContent = '...';
     try {
-      const tree = await kvQueryTree(currentAccount, contractId, path);
+      const tree = await kvQueryTree(accountOverride || currentAccount, contractOverride || contractId, path || undefined);
       children = tree && typeof tree === 'object' ? tree : {};
       childrenLoaded = true;
       renderChildren();
@@ -607,13 +711,165 @@ function createTreeNode(name, value, path, depth) {
       return;
     }
     entries.forEach(([k, v]) => {
-      childrenEl.appendChild(createTreeNode(k, v, `${path}/${k}`, depth + 1));
+      childrenEl.appendChild(createTreeNode(k, v, `${path}/${k}`, depth + 1, accountOverride, contractOverride));
     });
   }
 
   // If branch already has children data, pre-render them
   if (isBranch && childrenLoaded) {
     renderChildren();
+  }
+
+  row.onclick = toggle;
+  row.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  };
+
+  return container;
+}
+
+function createContractNode(contractName) {
+  const container = document.createElement('div');
+  let expanded = false;
+  let childrenLoaded = false;
+
+  const row = document.createElement('div');
+  row.className = 'tree-item';
+  row.tabIndex = 0;
+  row.setAttribute('role', 'treeitem');
+
+  const icon = document.createElement('span');
+  icon.className = 'tree-icon';
+  icon.textContent = '\u25b6';
+  row.appendChild(icon);
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tree-name branch';
+  nameEl.textContent = contractName;
+  nameEl.onclick = (e) => {
+    e.stopPropagation();
+    if (allContractsCheck) allContractsCheck.checked = false;
+    contractInput.value = contractName;
+    contractInput.disabled = false;
+    contractId = contractName;
+    multiAccountMode = true;
+    if (allAccountsCheck) allAccountsCheck.checked = true;
+    accountInput.value = '';
+    accountInput.disabled = true;
+    currentAccount = '';
+    queryInput.value = '';
+    breadcrumb = [];
+    explore();
+  };
+  row.appendChild(nameEl);
+
+  container.appendChild(row);
+
+  const childrenEl = document.createElement('div');
+  childrenEl.className = 'tree-children';
+  childrenEl.hidden = true;
+  container.appendChild(childrenEl);
+
+  async function toggle() {
+    expanded = !expanded;
+    icon.textContent = expanded ? '\u25bc' : '\u25b6';
+    row.setAttribute('aria-expanded', expanded);
+
+    if (expanded && !childrenLoaded) {
+      icon.textContent = '...';
+      try {
+        const { accounts } = await kvAccounts(contractName, { limit: MULTI_ACCOUNT_CAP });
+        childrenLoaded = true;
+        childrenEl.innerHTML = '';
+        if (accounts.length === 0) {
+          childrenEl.innerHTML = '<div class="tree-empty">(no accounts)</div>';
+        } else {
+          accounts.forEach(acct => {
+            childrenEl.appendChild(createAccountUnderContractNode(acct, contractName));
+          });
+        }
+        childrenEl.hidden = false;
+      } catch (e) {
+        console.error(`Failed to load accounts for ${contractName}:`, e);
+        childrenEl.innerHTML = '<div class="tree-empty">failed_</div>';
+        childrenEl.hidden = false;
+      }
+      icon.textContent = expanded ? '\u25bc' : '\u25b6';
+    } else {
+      childrenEl.hidden = !expanded;
+    }
+  }
+
+  row.onclick = toggle;
+  row.onkeydown = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  };
+
+  return container;
+}
+
+function createAccountUnderContractNode(accountName, parentContract) {
+  const container = document.createElement('div');
+  let expanded = false;
+  let childrenLoaded = false;
+
+  const row = document.createElement('div');
+  row.className = 'tree-item';
+  row.tabIndex = 0;
+  row.setAttribute('role', 'treeitem');
+
+  const icon = document.createElement('span');
+  icon.className = 'tree-icon';
+  icon.textContent = '\u25b6';
+  row.appendChild(icon);
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tree-name branch near-account';
+  nameEl.textContent = accountName;
+  nameEl.onclick = (e) => {
+    e.stopPropagation();
+    contractInput.value = parentContract;
+    contractId = parentContract;
+    navigateToAccount(accountName);
+  };
+  row.appendChild(nameEl);
+
+  container.appendChild(row);
+
+  const childrenEl = document.createElement('div');
+  childrenEl.className = 'tree-children';
+  childrenEl.hidden = true;
+  container.appendChild(childrenEl);
+
+  async function toggle() {
+    expanded = !expanded;
+    icon.textContent = expanded ? '\u25bc' : '\u25b6';
+    row.setAttribute('aria-expanded', expanded);
+
+    if (expanded && !childrenLoaded) {
+      icon.textContent = '...';
+      try {
+        const tree = await kvQueryTree(accountName, parentContract);
+        childrenLoaded = true;
+        childrenEl.innerHTML = '';
+        const entries = tree && typeof tree === 'object' ? Object.entries(tree) : [];
+        if (entries.length === 0) {
+          childrenEl.innerHTML = '<div class="tree-empty">(empty)</div>';
+        } else {
+          entries.forEach(([key, val]) => {
+            childrenEl.appendChild(createTreeNode(key, val, key, 0, accountName, parentContract));
+          });
+        }
+        childrenEl.hidden = false;
+      } catch (e) {
+        console.error(`Failed to load keys for ${accountName} on ${parentContract}:`, e);
+        childrenEl.innerHTML = '<div class="tree-empty">failed_</div>';
+        childrenEl.hidden = false;
+      }
+      icon.textContent = expanded ? '\u25bc' : '\u25b6';
+    } else {
+      childrenEl.hidden = !expanded;
+    }
   }
 
   row.onclick = toggle;
@@ -682,19 +938,19 @@ function selectNode(path, value) {
 
 function renderDetailMeta(entry) {
   let html = '';
-  if (entry.block_height != null) {
-    html += `<div><span class="meta-label">block: </span><span class="meta-value">${esc(String(entry.block_height))}</span></div>`;
+  if (entry.blockHeight != null) {
+    html += `<div><span class="meta-label">block: </span><span class="meta-value">${esc(String(entry.blockHeight))}</span></div>`;
   }
-  if (entry.tx_hash) {
-    html += `<div><span class="meta-label">tx: </span><a href="${EXPLORER_URL}/${encodeURIComponent(entry.tx_hash)}" target="_blank" rel="noopener noreferrer">${esc(entry.tx_hash.slice(0, 12))}...</a></div>`;
+  if (entry.txHash) {
+    html += `<div><span class="meta-label">tx: </span><a href="${EXPLORER_URL}/${encodeURIComponent(entry.txHash)}" target="_blank" rel="noopener noreferrer">${esc(entry.txHash.slice(0, 12))}...</a></div>`;
   }
-  if (entry.receipt_id) {
-    html += `<div><span class="meta-label">receipt: </span><span class="meta-value">${esc(entry.receipt_id.slice(0, 12))}...</span></div>`;
+  if (entry.receiptId) {
+    html += `<div><span class="meta-label">receipt: </span><span class="meta-value">${esc(entry.receiptId.slice(0, 12))}...</span></div>`;
   }
   if (entry.accountId) {
     html += `<div><span class="meta-label">writer: </span><span class="meta-writer">${esc(entry.accountId)}</span></div>`;
   }
-  if (entry.is_deleted) {
+  if (entry.isDeleted) {
     html += `<div><span class="meta-label">deleted: </span><span style="color:var(--danger)">true</span></div>`;
   }
   detailMeta.innerHTML = html;
@@ -715,14 +971,14 @@ function renderHistory(entries, meta) {
   entries.forEach((e) => {
     if (diffSelectA) {
       const opt = document.createElement('option');
-      opt.value = e.block_height;
-      opt.textContent = `#${e.block_height}`;
+      opt.value = e.blockHeight;
+      opt.textContent = `#${e.blockHeight}`;
       diffSelectA.appendChild(opt);
     }
     if (diffSelectB) {
       const opt = document.createElement('option');
-      opt.value = e.block_height;
-      opt.textContent = `#${e.block_height}`;
+      opt.value = e.blockHeight;
+      opt.textContent = `#${e.blockHeight}`;
       diffSelectB.appendChild(opt);
     }
   });
@@ -736,10 +992,10 @@ function renderHistory(entries, meta) {
 
     const block = document.createElement('span');
     block.className = 'history-block';
-    block.textContent = `#${e.block_height}`;
+    block.textContent = `#${e.blockHeight}`;
     row.appendChild(block);
 
-    if (e.is_deleted) {
+    if (e.isDeleted) {
       const del = document.createElement('span');
       del.className = 'history-deleted';
       del.textContent = 'deleted';
@@ -821,8 +1077,8 @@ async function loadFeed(accountId) {
       keySpan.textContent = item.key || '';
       const timeSpan = document.createElement('span');
       timeSpan.className = 'feed-item-time';
-      timeSpan.textContent = item.block_timestamp
-        ? timeAgo(Math.floor(Number(item.block_timestamp) / 1e6)) : '';
+      timeSpan.textContent = item.blockTimestamp
+        ? timeAgo(Math.floor(Number(item.blockTimestamp) / 1e6)) : '';
       header.appendChild(keySpan);
       header.appendChild(timeSpan);
       div.appendChild(header);
@@ -835,7 +1091,7 @@ async function loadFeed(accountId) {
 
       const blockDiv = document.createElement('div');
       blockDiv.className = 'feed-item-block';
-      blockDiv.textContent = `block ${item.block_height || ''}`;
+      blockDiv.textContent = `block ${item.blockHeight || ''}`;
       div.appendChild(blockDiv);
 
       feedList.appendChild(div);
@@ -869,32 +1125,24 @@ function navigateToAccount(accountId) {
   setAccount(accountId);
   queryInput.value = '';
   breadcrumb = [currentAccount];
-  explore('profile/**');
-}
-
-function handleQuickPath(path) {
-  if (path === 'recent') {
-    const acct = (typeof walletGetAccountId === 'function' && walletGetAccountId()) || currentAccount;
-    setViewMode('feed');
-    loadFeed(acct);
-    return;
-  }
-  queryInput.value = `${path}/**`;
-  currentAccount = accountInput.value || 'root.near';
-  breadcrumb = [currentAccount, path];
-  explore(`${path}/**`);
+  explore();
 }
 
 // ── View mode ───────────────────────────────────────────────
+
+const viewWriteBtn = $('#view-write');
+const writePanel = $('#write-panel');
 
 function setViewMode(mode) {
   viewMode = mode;
   viewTreeBtn.classList.toggle('active', mode === 'tree');
   viewJsonBtn.classList.toggle('active', mode === 'json');
-  if (viewPlantBtn) viewPlantBtn.classList.toggle('active', mode === 'plant');
+  if (viewWriteBtn) {
+    viewWriteBtn.classList.toggle('active', mode === 'write');
+    viewWriteBtn.setAttribute('aria-pressed', mode === 'write');
+  }
   viewTreeBtn.setAttribute('aria-pressed', mode === 'tree');
   viewJsonBtn.setAttribute('aria-pressed', mode === 'json');
-  if (viewPlantBtn) viewPlantBtn.setAttribute('aria-pressed', mode === 'plant');
   render();
   pushHash();
 }
@@ -907,14 +1155,14 @@ function render() {
   // Hide all panels first
   contentEl.hidden = true;
   jsonPanel.hidden = true;
-  if (plantPanel) plantPanel.hidden = true;
+  if (writePanel) writePanel.hidden = true;
   if (feedPanel) feedPanel.hidden = true;
 
-  if (viewMode === 'json') {
+  if (viewMode === 'write') {
+    if (writePanel) writePanel.hidden = false;
+  } else if (viewMode === 'json') {
     jsonPanel.hidden = false;
-    jsonView.textContent = rawData ? JSON.stringify(rawData, null, 2) : '';
-  } else if (viewMode === 'plant') {
-    if (plantPanel) plantPanel.hidden = false;
+    jsonView.textContent = loading ? 'loading...' : rawData ? JSON.stringify(rawData, null, 2) : 'no data';
   } else if (viewMode === 'feed') {
     if (feedPanel) feedPanel.hidden = false;
   } else {
@@ -928,13 +1176,14 @@ function render() {
 exploreForm.onsubmit = (e) => {
   e.preventDefault();
   const q = queryInput.value.trim();
-  currentAccount = accountInput.value || 'root.near';
+  const isMulti = allAccountsCheck && allAccountsCheck.checked;
+  currentAccount = isMulti ? '' : (accountInput.value.trim() || '');
   if (q) {
     const keyParts = q.replace(/\/?\*+$/, '').split('/');
-    breadcrumb = [currentAccount, ...keyParts];
+    breadcrumb = currentAccount ? [currentAccount, ...keyParts] : keyParts;
     explore(q);
   } else {
-    breadcrumb = [currentAccount];
+    breadcrumb = currentAccount ? [currentAccount] : [];
     explore();
   }
 };
@@ -943,21 +1192,23 @@ retryBtn.onclick = () => explore();
 
 viewTreeBtn.onclick = () => setViewMode('tree');
 viewJsonBtn.onclick = () => setViewMode('json');
-if (viewPlantBtn) viewPlantBtn.onclick = () => setViewMode('plant');
-
-quickPaths.onclick = (e) => {
-  const btn = e.target.closest('[data-path]');
-  if (btn) handleQuickPath(btn.dataset.path);
-};
+if (viewWriteBtn) viewWriteBtn.onclick = () => { if (!viewWriteBtn.disabled) setViewMode('write'); };
 
 contractInput.onchange = () => {
   contractId = contractInput.value;
+  if (typeof checkContractMismatch === 'function') checkContractMismatch();
   pushHash();
 };
 
 accountInput.onchange = () => {
   currentAccount = accountInput.value;
 };
+
+if (allContractsCheck) {
+  allContractsCheck.onchange = () => {
+    contractInput.disabled = allContractsCheck.checked;
+  };
+}
 
 if (allAccountsCheck) {
   allAccountsCheck.onchange = () => {
@@ -967,6 +1218,7 @@ if (allAccountsCheck) {
 
 function setAccount(accountId) {
   currentAccount = accountId;
+  multiAccountMode = false;
   if (accountInput) { accountInput.value = accountId; accountInput.disabled = false; }
   if (allAccountsCheck) allAccountsCheck.checked = false;
 }
@@ -1023,6 +1275,6 @@ window.addEventListener('hashchange', () => {
   readHash();
 });
 
-currentAccount = accountInput.value || 'root.near';
-breadcrumb = [currentAccount];
+currentAccount = accountInput.value.trim();
+breadcrumb = currentAccount ? [currentAccount] : [];
 // readHash() + explore() called from inline script after wallet.js loads

@@ -4,11 +4,11 @@ use scylla::errors::NextRowError;
 use scylla::statement::prepared::PreparedStatement;
 
 use crate::models::{
-    bigint_to_u64, AccountsParams, ContractAccountRow, EdgeRow, EdgeSourceEntry, HistoryParams,
+    bigint_to_u64, AccountsParams, ContractAccountRow, ContractRow, EdgeRow, EdgeSourceEntry,
+    HistoryParams,
     KvEntry, KvHistoryRow, KvRow, QueryParams, TimelineParams, WritersParams, MAX_DEDUP_SCAN,
     MAX_HISTORY_SCAN,
 };
-use crate::queries::compute_prefix_end;
 use fastnear_primitives::types::ChainId;
 use futures::stream::StreamExt;
 use futures::Stream;
@@ -143,6 +143,9 @@ pub struct ScyllaDb {
     accounts_by_contract_key: PreparedStatement,
     accounts_all: PreparedStatement,
     accounts_all_cursor: PreparedStatement,
+    contracts_all: PreparedStatement,
+    contracts_all_cursor: PreparedStatement,
+    contracts_by_account: PreparedStatement,
     edges_list: PreparedStatement,
     edges_list_cursor: PreparedStatement,
     edges_count: PreparedStatement,
@@ -352,6 +355,21 @@ impl ScyllaDb {
                 &format!("SELECT predecessor_id FROM {} WHERE TOKEN(predecessor_id) > TOKEN(?)", all_accounts_table_name),
                 scylla::frame::types::Consistency::LocalQuorum,
             ).await?,
+            contracts_all: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT DISTINCT current_account_id FROM {}", kv_accounts_table_name),
+                scylla::frame::types::Consistency::LocalQuorum,
+            ).await?,
+            contracts_all_cursor: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT DISTINCT current_account_id FROM {} WHERE TOKEN(current_account_id) > TOKEN(?)", kv_accounts_table_name),
+                scylla::frame::types::Consistency::LocalQuorum,
+            ).await?,
+            contracts_by_account: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT DISTINCT current_account_id FROM {} WHERE predecessor_id = ?", table_name),
+                scylla::frame::types::Consistency::LocalOne,
+            ).await?,
             edges_list: Self::prepare_query(
                 &scylla_session,
                 &format!("SELECT source, block_height FROM {} WHERE edge_type = ? AND target = ?", kv_edges_table_name),
@@ -474,13 +492,9 @@ impl ScyllaDb {
                 .rows_stream::<KvRow>()?,
         };
 
-        let exclude_null = params.exclude_null.unwrap_or(false);
+        let exclude_deleted = params.exclude_deleted.unwrap_or(false);
         let pred_filter = params.predecessor_id.clone();
-        let offset = if params.after_account.is_some() {
-            0
-        } else {
-            params.offset
-        };
+        let offset = effective_offset(params.after_account.as_deref(), params.offset);
         let page = collect_page(
             &mut rows_stream,
             params.limit,
@@ -493,7 +507,7 @@ impl ScyllaDb {
                         return None;
                     }
                 }
-                if exclude_null && entry.value == "null" {
+                if exclude_deleted && entry.value == "null" {
                     return None;
                 }
                 Some(entry)
@@ -528,19 +542,15 @@ impl ScyllaDb {
                 .rows_stream::<KvRow>()?,
         };
 
-        let exclude_null = params.exclude_null.unwrap_or(false);
-        let offset = if params.after_account.is_some() {
-            0
-        } else {
-            params.offset
-        };
+        let exclude_deleted = params.exclude_deleted.unwrap_or(false);
+        let offset = effective_offset(params.after_account.as_deref(), params.offset);
         let page = collect_page(
             &mut rows_stream,
             params.limit,
             offset,
             None,
             |row: KvRow| {
-                if exclude_null && row.value == "null" {
+                if exclude_deleted && row.value == "null" {
                     return None;
                 }
                 Some(row.predecessor_id)
@@ -693,6 +703,97 @@ impl ScyllaDb {
         Ok((page.items, page.has_more, page.dropped_rows))
     }
 
+    /// Query all distinct contract IDs from the `kv_accounts` table.
+    /// Uses TOKEN-based cursor for stable pagination across partitions.
+    ///
+    /// Returns `(contracts, has_more, dropped_rows)`.
+    pub async fn query_all_contracts(
+        &self,
+        limit: usize,
+        after_contract: Option<&str>,
+    ) -> anyhow::Result<(Vec<String>, bool, usize)> {
+        let mut rows_stream = match after_contract {
+            Some(cursor) => self
+                .scylla_session
+                .execute_iter(self.contracts_all_cursor.clone(), (cursor,))
+                .await?
+                .rows_stream::<ContractRow>()?,
+            None => self
+                .scylla_session
+                .execute_iter(self.contracts_all.clone(), &[])
+                .await?
+                .rows_stream::<ContractRow>()?,
+        };
+
+        let mut skipped_cursor = false;
+        let page = collect_page(
+            &mut rows_stream,
+            limit,
+            0,    // no offset — cursor handles resumption
+            None, // overfetch mode
+            |row: ContractRow| {
+                if !skipped_cursor {
+                    if let Some(c) = after_contract {
+                        if row.current_account_id == c {
+                            skipped_cursor = true;
+                            tracing::debug!(
+                                target: "fastkv-server",
+                                cursor = c,
+                                "Dropped cursor row reappearance (contracts)"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(row.current_account_id)
+            },
+        )
+        .await;
+
+        Ok((page.items, page.has_more, page.dropped_rows))
+    }
+
+    /// Query distinct contracts that a specific account has written to.
+    /// Uses `s_kv_last` where `predecessor_id` is the partition key, so this
+    /// is a cheap single-partition query.
+    ///
+    /// Returns `(contracts, has_more, dropped_rows)`.
+    pub async fn query_contracts_by_account(
+        &self,
+        account_id: &str,
+        limit: usize,
+        after_contract: Option<&str>,
+    ) -> anyhow::Result<(Vec<String>, bool, usize)> {
+        let mut rows_stream = self
+            .scylla_session
+            .execute_iter(self.contracts_by_account.clone(), (account_id,))
+            .await?
+            .rows_stream::<ContractRow>()?;
+
+        let after = after_contract.map(|s| s.to_string());
+        let mut past_cursor = after.is_none();
+        let page = collect_page(
+            &mut rows_stream,
+            limit,
+            0,
+            None, // overfetch mode
+            |row: ContractRow| {
+                if !past_cursor {
+                    if let Some(ref c) = after {
+                        if row.current_account_id <= *c {
+                            return None; // skip until past cursor
+                        }
+                    }
+                    past_cursor = true;
+                }
+                Some(row.current_account_id)
+            },
+        )
+        .await;
+
+        Ok((page.items, page.has_more, page.dropped_rows))
+    }
+
     /// Returns (entries, has_more, dropped_rows).
     pub async fn query_kv_with_pagination(
         &self,
@@ -751,12 +852,8 @@ impl ScyllaDb {
                 .rows_stream::<KvRow>()?,
         };
 
-        let exclude_null = params.exclude_null.unwrap_or(false);
-        let offset = if params.after_key.is_some() {
-            0
-        } else {
-            params.offset
-        };
+        let exclude_deleted = params.exclude_deleted.unwrap_or(false);
+        let offset = effective_offset(params.after_key.as_deref(), params.offset);
         let page = collect_page(
             &mut rows_stream,
             params.limit,
@@ -764,7 +861,7 @@ impl ScyllaDb {
             None,
             |row: KvRow| {
                 let entry = KvEntry::from(row);
-                if exclude_null && entry.value == "null" {
+                if exclude_deleted && entry.value == "null" {
                     return None;
                 }
                 Some(entry)
@@ -851,14 +948,7 @@ impl ScyllaDb {
         .await;
 
         // Post-sort (scan-cap mode collects all, caller sorts + slices)
-        let is_asc = params.order.eq_ignore_ascii_case("asc");
-        page.items.sort_by(|a, b| {
-            if is_asc {
-                a.block_height.cmp(&b.block_height)
-            } else {
-                b.block_height.cmp(&a.block_height)
-            }
-        });
+        sort_by_block_height(&mut page.items, params.order.eq_ignore_ascii_case("asc"));
 
         let result: Vec<KvEntry> = page.items.into_iter().skip(params.offset).collect();
         let has_more = result.len() > params.limit;
@@ -958,14 +1048,7 @@ impl ScyllaDb {
         .await;
 
         // Post-sort (scan-cap mode collects all, caller sorts + slices)
-        let is_asc = params.order.eq_ignore_ascii_case("asc");
-        page.items.sort_by(|a, b| {
-            if is_asc {
-                a.block_height.cmp(&b.block_height)
-            } else {
-                b.block_height.cmp(&a.block_height)
-            }
-        });
+        sort_by_block_height(&mut page.items, params.order.eq_ignore_ascii_case("asc"));
 
         let has_more = page.items.len() > params.limit;
         page.items.truncate(params.limit);
@@ -988,6 +1071,24 @@ impl ScyllaDb {
 
         Ok(block_height)
     }
+}
+
+fn compute_prefix_end(prefix: &str) -> String {
+    format!("{prefix}\u{ff}")
+}
+
+fn effective_offset(cursor: Option<&str>, offset: usize) -> usize {
+    if cursor.is_some() { 0 } else { offset }
+}
+
+fn sort_by_block_height(entries: &mut [KvEntry], is_asc: bool) {
+    entries.sort_by(|a, b| {
+        if is_asc {
+            a.block_height.cmp(&b.block_height)
+        } else {
+            b.block_height.cmp(&a.block_height)
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1113,5 +1214,12 @@ mod tests {
         assert!(!page.has_more);
         assert!(!page.truncated);
         assert_eq!(page.dropped_rows, 0);
+    }
+
+    #[test]
+    fn test_compute_prefix_end() {
+        assert_eq!(compute_prefix_end("graph/follow/"), "graph/follow/\u{ff}");
+        assert_eq!(compute_prefix_end("test"), "test\u{ff}");
+        assert_eq!(compute_prefix_end(""), "\u{ff}");
     }
 }

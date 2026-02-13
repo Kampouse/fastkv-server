@@ -1,12 +1,12 @@
 mod handlers;
 mod models;
-mod queries;
 mod scylladb;
 mod social_handlers;
 mod tree;
 
 use crate::handlers::{
-    accounts_handler, batch_kv_handler, diff_kv_handler, edges_count_handler, edges_handler,
+    accounts_handler, batch_kv_handler, contracts_handler, diff_kv_handler, edges_count_handler,
+    edges_handler,
     get_kv_handler, health_check, history_kv_handler, query_kv_handler, status_handler,
     timeline_kv_handler, writers_handler,
 };
@@ -43,6 +43,7 @@ use crate::models::PROJECT_ID;
         handlers::timeline_kv_handler,
         handlers::batch_kv_handler,
         handlers::accounts_handler,
+        handlers::contracts_handler,
         handlers::edges_handler,
         handlers::edges_count_handler,
         social_handlers::social_get_handler,
@@ -69,6 +70,7 @@ use crate::models::PROJECT_ID;
         models::DiffResponse,
         models::TimelineParams,
         models::AccountsQueryParams,
+        models::ContractsQueryParams,
         models::EdgesParams,
         models::EdgesCountParams,
         models::EdgeSourceEntry,
@@ -82,9 +84,7 @@ use crate::models::PROJECT_ID;
         models::SocialFollowParams,
         models::SocialAccountFeedParams,
         models::IndexEntry,
-        models::IndexResponse,
         models::SocialFollowResponse,
-        models::SocialFeedResponse,
         models::PaginationMeta,
     )),
     info(
@@ -272,6 +272,7 @@ async fn main() -> std::io::Result<()> {
             .service(diff_kv_handler)
             .service(timeline_kv_handler)
             .service(accounts_handler)
+            .service(contracts_handler)
             .service(edges_handler)
             .service(edges_count_handler)
             .service(social_get_handler)

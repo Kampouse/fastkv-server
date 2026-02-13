@@ -22,6 +22,40 @@ fn resolve_contract(contract_id: &Option<String>) -> Result<&str, ApiError> {
     }
 }
 
+fn build_social_query(
+    account_id: String,
+    contract: &str,
+    key_prefix: Option<String>,
+    exclude_deleted: bool,
+) -> QueryParams {
+    QueryParams {
+        predecessor_id: account_id,
+        current_account_id: contract.to_string(),
+        key_prefix,
+        exclude_deleted: Some(exclude_deleted),
+        limit: MAX_SOCIAL_RESULTS,
+        offset: 0,
+        fields: None,
+        format: None,
+        value_format: None,
+        after_key: None,
+    }
+}
+
+fn build_writers_query(key: String, contract: &str) -> WritersParams {
+    WritersParams {
+        key,
+        current_account_id: contract.to_string(),
+        predecessor_id: None,
+        exclude_deleted: None,
+        limit: MAX_SOCIAL_RESULTS,
+        offset: 0,
+        fields: None,
+        value_format: None,
+        after_account: None,
+    }
+}
+
 // ===== Key pattern parsing =====
 
 enum KeyPattern {
@@ -44,7 +78,7 @@ enum KeyPattern {
 fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
     if pattern.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "key pattern cannot be empty".to_string(),
+            "keys[]: pattern cannot be empty".to_string(),
         ));
     }
 
@@ -54,7 +88,7 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
             // Just an account ID with no key path — treat as recursive wildcard on all keys
             if pattern.len() > MAX_ACCOUNT_ID_LENGTH {
                 return Err(ApiError::InvalidParameter(
-                    "account ID too long".to_string(),
+                    "keys[]: account ID exceeds max length".to_string(),
                 ));
             }
             return Ok(KeyPattern::RecursiveWildcard {
@@ -68,7 +102,7 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
         // Wildcard account — only exact key supported
         if key_part.contains('*') {
             return Err(ApiError::InvalidParameter(
-                "wildcard account with wildcard key (*/prefix/**) is not supported".to_string(),
+                "keys[]: wildcard account with wildcard key not supported".to_string(),
             ));
         }
         return Ok(KeyPattern::WildcardAccount {
@@ -78,14 +112,13 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
 
     if account_part.len() > MAX_ACCOUNT_ID_LENGTH {
         return Err(ApiError::InvalidParameter(
-            "account ID too long".to_string(),
+            "keys[]: account ID exceeds max length".to_string(),
         ));
     }
 
     if key_part.len() > MAX_KEY_LENGTH {
         return Err(ApiError::InvalidParameter(format!(
-            "key pattern cannot exceed {} characters",
-            MAX_KEY_LENGTH
+            "keys[]: pattern exceeds {MAX_KEY_LENGTH} characters"
         )));
     }
 
@@ -242,7 +275,8 @@ async fn query_index(q: IndexQuery<'_>) -> Result<(Vec<IndexEntry>, usize, bool)
     request_body = SocialGetBody,
     responses(
         (status = 200, description = "Nested JSON matching SocialDB get() format"),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -253,13 +287,12 @@ pub async fn social_get_handler(
 ) -> Result<HttpResponse, ApiError> {
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "keys cannot be empty".to_string(),
+            "keys: cannot be empty".to_string(),
         ));
     }
     if body.keys.len() > MAX_SOCIAL_KEYS {
         return Err(ApiError::InvalidParameter(format!(
-            "keys cannot exceed {} patterns",
-            MAX_SOCIAL_KEYS
+            "keys: cannot exceed {MAX_SOCIAL_KEYS} patterns"
         )));
     }
 
@@ -315,26 +348,8 @@ pub async fn social_get_handler(
                 account_id,
                 key_prefix,
             } => {
-                let query = QueryParams {
-                    predecessor_id: account_id.clone(),
-                    current_account_id: contract.to_string(),
-                    key_prefix: if key_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(key_prefix)
-                    },
-                    exclude_null: if return_deleted {
-                        Some(false)
-                    } else {
-                        Some(true)
-                    },
-                    limit: MAX_SOCIAL_RESULTS,
-                    offset: 0,
-                    fields: None,
-                    format: None,
-                    value_format: None,
-                    after_key: None,
-                };
+                let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix) };
+                let query = build_social_query(account_id.clone(), contract, prefix, !return_deleted);
 
                 let (entries, _has_more, dropped) =
                     scylladb.query_kv_with_pagination(&query).await?;
@@ -367,26 +382,8 @@ pub async fn social_get_handler(
                 account_id,
                 key_prefix,
             } => {
-                let query = QueryParams {
-                    predecessor_id: account_id.clone(),
-                    current_account_id: contract.to_string(),
-                    key_prefix: if key_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(key_prefix.clone())
-                    },
-                    exclude_null: if return_deleted {
-                        Some(false)
-                    } else {
-                        Some(true)
-                    },
-                    limit: MAX_SOCIAL_RESULTS,
-                    offset: 0,
-                    fields: None,
-                    format: None,
-                    value_format: None,
-                    after_key: None,
-                };
+                let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.clone()) };
+                let query = build_social_query(account_id.clone(), contract, prefix, !return_deleted);
 
                 let (entries, _has_more, dropped) =
                     scylladb.query_kv_with_pagination(&query).await?;
@@ -418,17 +415,7 @@ pub async fn social_get_handler(
             }
             KeyPattern::WildcardAccount { key } => {
                 // Use by-key view to find all predecessors with this exact key
-                let by_key_params = WritersParams {
-                    key: key.clone(),
-                    current_account_id: contract.to_string(),
-                    predecessor_id: None,
-                    exclude_null: None,
-                    limit: MAX_SOCIAL_RESULTS,
-                    offset: 0,
-                    fields: None,
-                    value_format: None,
-                    after_account: None,
-                };
+                let by_key_params = build_writers_query(key.clone(), contract);
                 let (entries, _has_more, _truncated, dropped) =
                     scylladb.query_writers(&by_key_params).await?;
                 if dropped > 0 {
@@ -466,7 +453,8 @@ pub async fn social_get_handler(
     request_body = SocialKeysBody,
     responses(
         (status = 200, description = "Nested JSON with key structure"),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -477,13 +465,12 @@ pub async fn social_keys_handler(
 ) -> Result<HttpResponse, ApiError> {
     if body.keys.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "keys cannot be empty".to_string(),
+            "keys: cannot be empty".to_string(),
         ));
     }
     if body.keys.len() > MAX_SOCIAL_KEYS {
         return Err(ApiError::InvalidParameter(format!(
-            "keys cannot exceed {} patterns",
-            MAX_SOCIAL_KEYS
+            "keys: cannot exceed {MAX_SOCIAL_KEYS} patterns"
         )));
     }
 
@@ -547,23 +534,8 @@ pub async fn social_keys_handler(
             } => {
                 // keys() only supports * (not **), but we handle both the same way for robustness
                 // keys() returns key structure — fetch all keys including deleted
-                // unless return_deleted is explicitly false AND values_only is set
-                let query = QueryParams {
-                    predecessor_id: account_id.clone(),
-                    current_account_id: contract.to_string(),
-                    key_prefix: if key_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(key_prefix.clone())
-                    },
-                    exclude_null: Some(false),
-                    limit: MAX_SOCIAL_RESULTS,
-                    offset: 0,
-                    fields: None,
-                    format: None,
-                    value_format: None,
-                    after_key: None,
-                };
+                let prefix = if key_prefix.is_empty() { None } else { Some(key_prefix.clone()) };
+                let query = build_social_query(account_id.clone(), contract, prefix, false);
 
                 let (entries, _has_more, dropped) =
                     scylladb.query_kv_with_pagination(&query).await?;
@@ -669,17 +641,7 @@ pub async fn social_keys_handler(
                 }
             }
             KeyPattern::WildcardAccount { key } => {
-                let by_key_params = WritersParams {
-                    key: key.clone(),
-                    current_account_id: contract.to_string(),
-                    predecessor_id: None,
-                    exclude_null: None,
-                    limit: MAX_SOCIAL_RESULTS,
-                    offset: 0,
-                    fields: None,
-                    value_format: None,
-                    after_account: None,
-                };
+                let by_key_params = build_writers_query(key.clone(), contract);
                 let (entries, _has_more, _truncated, dropped) =
                     scylladb.query_writers(&by_key_params).await?;
                 if dropped > 0 {
@@ -724,8 +686,9 @@ pub async fn social_keys_handler(
     path = "/v1/social/index",
     params(SocialIndexParams),
     responses(
-        (status = 200, description = "Index entries", body = IndexResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 200, description = "Index entries", body = inline(PaginatedResponse<IndexEntry>)),
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -736,24 +699,22 @@ pub async fn social_index_handler(
 ) -> Result<HttpResponse, ApiError> {
     if query.action.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "action cannot be empty".to_string(),
+            "action: cannot be empty".to_string(),
         ));
     }
     if query.action.len() > MAX_KEY_LENGTH {
         return Err(ApiError::InvalidParameter(format!(
-            "action cannot exceed {} characters",
-            MAX_KEY_LENGTH
+            "action: cannot exceed {MAX_KEY_LENGTH} characters"
         )));
     }
     if query.key.is_empty() {
         return Err(ApiError::InvalidParameter(
-            "key cannot be empty".to_string(),
+            "key: cannot be empty".to_string(),
         ));
     }
     if query.key.len() > MAX_KEY_LENGTH {
         return Err(ApiError::InvalidParameter(format!(
-            "key cannot exceed {} characters",
-            MAX_KEY_LENGTH
+            "key: cannot exceed {MAX_KEY_LENGTH} characters"
         )));
     }
     validate_limit(query.limit)?;
@@ -763,26 +724,34 @@ pub async fn social_index_handler(
 
     tracing::info!(target: PROJECT_ID, action = %query.action, key = %query.key, contract_id = %contract, "GET /v1/social/index");
 
+    // Overfetch by 1 to detect has_more
     let (entries, dropped, timed_out) = query_index(IndexQuery {
         app_state: &app_state,
         contract_id: contract,
         action: &query.action,
         key: &query.key,
         order: &order,
-        limit: query.limit,
+        limit: query.limit + 1,
         from: query.from,
         account_id: query.account_id.as_deref(),
     })
     .await?;
 
-    let mut response = HttpResponse::Ok();
-    if dropped > 0 {
-        response.insert_header(("X-Dropped-Rows", dropped.to_string()));
-    }
-    if timed_out {
-        response.insert_header(("X-Results-Truncated", "true"));
-    }
-    Ok(response.json(IndexResponse { entries }))
+    let has_more = entries.len() > query.limit;
+    let entries: Vec<IndexEntry> = entries.into_iter().take(query.limit).collect();
+    let next_cursor = entries.last().map(|e| e.block_height.to_string());
+
+    let meta = PaginationMeta {
+        has_more,
+        truncated: timed_out,
+        next_cursor,
+        dropped_rows: dropped_to_option(dropped),
+    };
+
+    Ok(HttpResponse::Ok().json(PaginatedResponse {
+        data: entries,
+        meta,
+    }))
 }
 
 /// Get a user's profile from SocialDB
@@ -792,7 +761,8 @@ pub async fn social_index_handler(
     params(SocialProfileParams),
     responses(
         (status = 200, description = "Profile JSON"),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -807,18 +777,7 @@ pub async fn social_profile_handler(
     tracing::info!(target: PROJECT_ID, account_id = %query.account_id, contract_id = %contract, "GET /v1/social/profile");
 
     let scylladb = require_db(&app_state).await?;
-    let params = QueryParams {
-        predecessor_id: query.account_id.clone(),
-        current_account_id: contract.to_string(),
-        key_prefix: Some("profile/".to_string()),
-        exclude_null: Some(true),
-        limit: MAX_SOCIAL_RESULTS,
-        offset: 0,
-        fields: None,
-        format: None,
-        value_format: None,
-        after_key: None,
-    };
+    let params = build_social_query(query.account_id.clone(), contract, Some("profile/".to_string()), true);
 
     let (entries, _has_more, dropped) = scylladb.query_kv_with_pagination(&params).await?;
     if dropped > 0 {
@@ -844,7 +803,8 @@ pub async fn social_profile_handler(
     params(SocialFollowParams),
     responses(
         (status = 200, description = "Follower accounts", body = SocialFollowResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -873,7 +833,7 @@ pub async fn social_followers_handler(
     let params = AccountsParams {
         current_account_id: contract.to_string(),
         key: follow_key,
-        exclude_null: Some(true),
+        exclude_deleted: Some(true),
         limit: query.limit,
         offset: query.offset,
         after_account: query.after_account.clone(),
@@ -884,7 +844,7 @@ pub async fn social_followers_handler(
     let next_cursor = accounts.last().cloned();
 
     Ok(HttpResponse::Ok().json(SocialFollowResponse {
-        accounts,
+        data: accounts,
         count,
         meta: PaginationMeta {
             has_more,
@@ -902,7 +862,8 @@ pub async fn social_followers_handler(
     params(SocialFollowParams),
     responses(
         (status = 200, description = "Following accounts", body = SocialFollowResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -930,7 +891,7 @@ pub async fn social_following_handler(
         predecessor_id: query.account_id.clone(),
         current_account_id: contract.to_string(),
         key_prefix: Some("graph/follow/".to_string()),
-        exclude_null: Some(true),
+        exclude_deleted: Some(true),
         limit: query.limit,
         offset: query.offset,
         fields: None,
@@ -952,7 +913,7 @@ pub async fn social_following_handler(
     let next_cursor = accounts.last().cloned();
 
     Ok(HttpResponse::Ok().json(SocialFollowResponse {
-        accounts,
+        data: accounts,
         count,
         meta: PaginationMeta {
             has_more,
@@ -969,8 +930,9 @@ pub async fn social_following_handler(
     path = "/v1/social/feed/account",
     params(SocialAccountFeedParams),
     responses(
-        (status = 200, description = "Account feed", body = SocialFeedResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError)
+        (status = 200, description = "Account feed", body = inline(PaginatedResponse<IndexEntry>)),
+        (status = 400, description = "Invalid parameters", body = ApiError),
+        (status = 503, description = "Database unavailable", body = ApiError),
     ),
     tag = "social"
 )]
@@ -1011,12 +973,15 @@ pub async fn social_account_feed_handler(
         value: serde_json::from_str(&e.value).ok(),
     };
 
+    // Overfetch by 1 to detect has_more
+    let fetch_limit = query.limit + 1;
+
     // Query history for post/main key to get all posts with their block heights
     let history_params = HistoryParams {
         predecessor_id: query.account_id.clone(),
         current_account_id: contract.to_string(),
         key: "post/main".to_string(),
-        limit: query.limit,
+        limit: fetch_limit,
         order: query.order.clone(),
         from_block,
         to_block,
@@ -1028,7 +993,7 @@ pub async fn social_account_feed_handler(
         predecessor_id: query.account_id.clone(),
         current_account_id: contract.to_string(),
         key: "post/comment".to_string(),
-        limit: query.limit,
+        limit: fetch_limit,
         order: query.order.clone(),
         from_block,
         to_block,
@@ -1036,7 +1001,7 @@ pub async fn social_account_feed_handler(
         value_format: None,
     };
 
-    let posts: Vec<IndexEntry> = if include_replies {
+    let all_posts: Vec<IndexEntry> = if include_replies {
         let ((entries, _hm1, _tr1, dropped1), (comment_entries, _hm2, _tr2, dropped2)) =
             futures::future::try_join(
                 scylladb.get_kv_history(&history_params),
@@ -1060,7 +1025,7 @@ pub async fn social_account_feed_handler(
             combined.sort_by(|a, b| b.block_height.cmp(&a.block_height));
         }
 
-        combined.truncate(query.limit);
+        combined.truncate(fetch_limit);
         combined
     } else {
         let (entries, _has_more, _truncated, dropped) =
@@ -1071,7 +1036,21 @@ pub async fn social_account_feed_handler(
         entries.into_iter().map(to_index_entry).collect()
     };
 
-    Ok(HttpResponse::Ok().json(SocialFeedResponse { posts }))
+    let has_more = all_posts.len() > query.limit;
+    let posts: Vec<IndexEntry> = all_posts.into_iter().take(query.limit).collect();
+    let next_cursor = posts.last().map(|e| e.block_height.to_string());
+
+    let meta = PaginationMeta {
+        has_more,
+        truncated: false,
+        next_cursor,
+        dropped_rows: None,
+    };
+
+    Ok(HttpResponse::Ok().json(PaginatedResponse {
+        data: posts,
+        meta,
+    }))
 }
 
 // ===== Utility functions =====

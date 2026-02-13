@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; connect-src 'self' https://rpc.mainnet.near.org https://app.mynearwallet.com https://nearblocks.io; img-src 'self' data:" />
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://esm.sh; style-src 'self' 'unsafe-inline'; connect-src 'self' https://rpc.mainnet.near.org https://nearblocks.io; img-src 'self' data:" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>NEAR Garden</title>
     <meta
@@ -29,6 +29,14 @@
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127793;</text></svg>"
     />
     <link rel="stylesheet" href="/style.css" />
+    <script type="importmap">
+    {
+      "imports": {
+        "near-kit": "https://esm.sh/near-kit@0.11.0",
+        "@hot-labs/near-connect": "https://esm.sh/@hot-labs/near-connect@0.9.0"
+      }
+    }
+    </script>
   </head>
   <body>
     <header>
@@ -60,40 +68,38 @@
           <input
             id="contract-input"
             type="text"
-            value="contextual.near"
+            placeholder="contextual.near"
             spellcheck="false"
+            disabled
           />
+          <label class="all-accounts-toggle" title="Query all contracts (slower)">
+            <input type="checkbox" id="all-contracts-check" checked />
+            <span>all</span>
+          </label>
         </div>
         <div class="contract-row">
           <label for="account-input" class="label">account</label>
           <input
             id="account-input"
             type="text"
-            value="root.near"
+            placeholder="root.near"
             spellcheck="false"
+            disabled
           />
+          <label class="all-accounts-toggle" title="Query all accounts on this contract (slower)">
+            <input type="checkbox" id="all-accounts-check" checked />
+            <span>all</span>
+          </label>
         </div>
         <form id="explore-form" class="search-row">
           <input
             id="query-input"
             type="text"
-            placeholder="profile/**"
+            placeholder="key"
             spellcheck="false"
           />
-          <label class="all-accounts-toggle">
-            <input type="checkbox" id="all-accounts-check" />
-            <span>all accounts</span>
-          </label>
           <button type="submit" id="explore-btn">explore_</button>
         </form>
-        <div class="quick-paths" id="quick-paths">
-          <button type="button" data-path="profile">profile</button>
-          <button type="button" data-path="graph">graph</button>
-          <button type="button" data-path="index">index</button>
-          <button type="button" data-path="recent" id="quick-recent">
-            recent
-          </button>
-        </div>
       </div>
 
       <div id="breadcrumb" class="breadcrumb"></div>
@@ -108,7 +114,7 @@
         </button>
       </div>
 
-      <div id="error-bar" class="error-bar" hidden>
+      <div id="error-bar" class="error-bar" hidden aria-live="polite">
         <span id="error-msg"></span>
         <button type="button" id="retry-btn">retry_</button>
       </div>
@@ -143,6 +149,10 @@
 
       <!-- Write panel -->
       <div id="write-panel" class="panel write-panel" hidden>
+        <div id="write-connect-prompt" class="write-connect-prompt">
+          <div>connect a NEAR wallet to write data on-chain</div>
+          <button type="button" onclick="walletSignIn()">connect wallet</button>
+        </div>
         <div class="write-header">
           <span class="write-label">write to __fastdata_kv</span>
           <button type="button" id="write-mode-toggle" class="write-mode-btn" onclick="toggleBatchMode()">batch</button>
@@ -184,8 +194,7 @@
         </div>
 
         <div id="write-preview" class="write-preview"></div>
-        <div id="write-mismatch" class="write-mismatch" hidden></div>
-        <div class="write-note">wallet access key is scoped to the contract at sign-in time</div>
+        <div class="write-note">transactions are signed via wallet popup</div>
         <button
           type="button"
           id="write-btn"
@@ -194,7 +203,7 @@
         >
           write_
         </button>
-        <div id="write-status" class="write-status"></div>
+        <div id="write-status" class="write-status" aria-live="polite"></div>
       </div>
 
       <!-- Feed panel (timeline) -->
@@ -238,13 +247,10 @@
       </p>
     </footer>
 
-    <script src="https://cdn.jsdelivr.net/npm/near-api-js@0.44.2/dist/near-api-js.min.js"
-            integrity="sha384-OIbczhz0u4wyBuKP6D2eXzNExspUDsTcI0vPIstAG5ILjux+LJ+uxHZ5ZI4L1QLH"
-            crossorigin="anonymous"></script>
     <script src="/app.js"></script>
-    <script src="/wallet.js"></script>
-    <script>
-      if (!readHash()) explore('profile/**');
+    <script type="module" src="/wallet.js"></script>
+    <script type="module">
+      if (!readHash()) explore();
       initNear().catch((e) => console.warn("Wallet init failed:", e));
     </script>
   </body>
