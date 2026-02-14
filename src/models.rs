@@ -69,10 +69,18 @@ pub struct ContractAccountRow {
     pub predecessor_id: String,
 }
 
-// Lightweight row for contract listing (current_account_id only)
+// Row for DISTINCT contract listing from kv_accounts (partition key only)
 #[derive(DeserializeRow, Debug, Clone)]
 pub struct ContractRow {
     pub current_account_id: String,
+}
+
+// Row for contract listing from s_kv_last (includes key clustering column)
+#[derive(DeserializeRow, Debug, Clone)]
+pub struct ContractKeyRow {
+    pub current_account_id: String,
+    #[allow(dead_code)]
+    pub key: String,
 }
 
 // API response

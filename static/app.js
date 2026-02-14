@@ -201,6 +201,7 @@ function copyAsCurl() {
 
 async function kvContracts(opts) {
   const params = {};
+  params.scan = '1';
   if (opts?.accountId) params.accountId = opts.accountId;
   if (opts?.limit) params.limit = String(opts.limit);
   if (opts?.after_contract) params.after_contract = opts.after_contract;

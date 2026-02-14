@@ -4,7 +4,7 @@ use scylla::errors::NextRowError;
 use scylla::statement::prepared::PreparedStatement;
 
 use crate::models::{
-    bigint_to_u64, AccountsParams, ContractAccountRow, ContractRow, EdgeRow, EdgeSourceEntry,
+    bigint_to_u64, AccountsParams, ContractAccountRow, ContractKeyRow, ContractRow, EdgeRow, EdgeSourceEntry,
     HistoryParams, KvEntry, KvHistoryRow, KvRow, KvTimelineRow, QueryParams, TimelineParams,
     WritersParams, MAX_DEDUP_SCAN,
 };
@@ -379,7 +379,7 @@ impl ScyllaDb {
             ).await?,
             contracts_by_account: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT DISTINCT current_account_id FROM {} WHERE predecessor_id = ?", table_name),
+                &format!("SELECT current_account_id, key FROM {} WHERE predecessor_id = ?", table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             edges_list: Self::prepare_query(
@@ -780,16 +780,25 @@ impl ScyllaDb {
             .scylla_session
             .execute_iter(self.contracts_by_account.clone(), (account_id,))
             .await?
-            .rows_stream::<ContractRow>()?;
+            .rows_stream::<ContractKeyRow>()?;
 
         let after = after_contract.map(|s| s.to_string());
         let mut past_cursor = after.is_none();
+        let mut last_contract: Option<String> = None;
         let page = collect_page(
             &mut rows_stream,
             limit,
             0,
             None, // overfetch mode
-            |row: ContractRow| {
+            |row: ContractKeyRow| {
+                // Deduplicate: rows are ordered by current_account_id ASC
+                if let Some(ref prev) = last_contract {
+                    if row.current_account_id == *prev {
+                        return None;
+                    }
+                }
+                last_contract = Some(row.current_account_id.clone());
+
                 if !past_cursor {
                     if let Some(ref c) = after {
                         if row.current_account_id <= *c {
