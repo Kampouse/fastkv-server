@@ -195,11 +195,18 @@ async fn query_index(q: IndexQuery<'_>) -> Result<(Vec<IndexEntry>, usize, bool)
 
     let mut entries: Vec<IndexEntry> = Vec::new();
     let mut error_count = 0usize;
+    let mut rows_scanned = 0usize;
+    const MAX_INDEX_SCAN: usize = 10_000;
 
     let stream_result = actix_web::rt::time::timeout(
         std::time::Duration::from_secs(30),
         async {
             while let Some(row_result) = rows_stream.next().await {
+                rows_scanned += 1;
+                if rows_scanned >= MAX_INDEX_SCAN {
+                    return Ok(true); // scan cap hit
+                }
+
                 let row = match row_result {
                     Ok(row) => row,
                     Err(e) => {
@@ -246,13 +253,13 @@ async fn query_index(q: IndexQuery<'_>) -> Result<(Vec<IndexEntry>, usize, bool)
                     break;
                 }
             }
-            Ok(())
+            Ok(false) // stream exhausted normally
         },
     )
     .await;
 
     let timed_out = match stream_result {
-        Ok(Ok(())) => false,
+        Ok(Ok(scan_capped)) => scan_capped,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             tracing::warn!(target: PROJECT_ID, "query_index stream timed out after 30s, returning partial results");
@@ -987,12 +994,12 @@ pub async fn social_account_feed_handler(
         current_account_id: contract.to_string(),
         key: "post/main".to_string(),
         limit: fetch_limit,
-        offset: 0,
         order: query.order.clone(),
         from_block,
         to_block,
         fields: None,
         value_format: None,
+        cursor: None,
     };
 
     let comment_params = HistoryParams {
@@ -1000,16 +1007,16 @@ pub async fn social_account_feed_handler(
         current_account_id: contract.to_string(),
         key: "post/comment".to_string(),
         limit: fetch_limit,
-        offset: 0,
         order: query.order.clone(),
         from_block,
         to_block,
         fields: None,
         value_format: None,
+        cursor: None,
     };
 
     let (all_posts, total_dropped): (Vec<IndexEntry>, usize) = if include_replies {
-        let ((entries, _hm1, _tr1, dropped1), (comment_entries, _hm2, _tr2, dropped2)) =
+        let ((entries, _hm1, dropped1, _), (comment_entries, _hm2, dropped2, _)) =
             futures::future::try_join(
                 scylladb.get_kv_history(&history_params),
                 scylladb.get_kv_history(&comment_params),
@@ -1035,7 +1042,7 @@ pub async fn social_account_feed_handler(
         combined.truncate(fetch_limit);
         (combined, dropped)
     } else {
-        let (entries, _has_more, _truncated, dropped) =
+        let (entries, _has_more, dropped, _) =
             scylladb.get_kv_history(&history_params).await?;
         if dropped > 0 {
             tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social feed");

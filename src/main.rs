@@ -106,7 +106,7 @@ struct ApiDoc;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub scylladb: Arc<RwLock<Option<ScyllaDb>>>,
+    pub scylladb: Arc<RwLock<Option<Arc<ScyllaDb>>>>,
     pub chain_id: ChainId,
     /// Per-IP throttle for scan=1 requests on /v1/kv/accounts.
     pub scan_throttle: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
@@ -139,7 +139,7 @@ async fn main() -> std::io::Result<()> {
         env::var(var).unwrap_or_else(|_| panic!("{var} must be set"));
     }
 
-    let scylladb: Arc<RwLock<Option<ScyllaDb>>> = Arc::new(RwLock::new(None));
+    let scylladb: Arc<RwLock<Option<Arc<ScyllaDb>>>> = Arc::new(RwLock::new(None));
     tracing::info!(target: PROJECT_ID, "Database connection deferred to background task");
 
     // Background reconnection task with exponential backoff
@@ -180,7 +180,7 @@ async fn main() -> std::io::Result<()> {
                 }
                 match ScyllaDb::new(chain_id, session).await {
                     Ok(db) => {
-                        *scylladb.write().await = Some(db);
+                        *scylladb.write().await = Some(Arc::new(db));
                         delay_secs = reconnect_base_secs;
                         tracing::info!(target: PROJECT_ID, "Successfully connected to ScyllaDB");
                     }
@@ -200,9 +200,10 @@ async fn main() -> std::io::Result<()> {
         let scylladb = Arc::clone(&scylladb);
         tokio::spawn(async move {
             loop {
-                if let Some(db) = scylladb.read().await.as_ref() {
+                let db = scylladb.read().await.clone();
+                if let Some(ref db) = db {
                     if let Ok(Some(h)) = db.get_indexer_block_height().await {
-                        cache.store(h, Ordering::Relaxed);
+                        cache.store(h, Ordering::Release);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -244,7 +245,7 @@ async fn main() -> std::io::Result<()> {
             .wrap_fn({
                 let cache = block_cache;
                 move |req, srv| {
-                    let h = cache.load(Ordering::Relaxed);
+                    let h = cache.load(Ordering::Acquire);
                     let path = req.path().to_string();
                     let method = req.method().clone();
                     let fut = srv.call(req);
@@ -258,7 +259,10 @@ async fn main() -> std::io::Result<()> {
                         }
                         // Cache-Control for successful GET API responses
                         if method == actix_web::http::Method::GET && res.status().is_success() {
-                            let cc = if path == "/health" || path == "/v1/status" {
+                            let cc = if path == "/health"
+                                || path == "/v1/status"
+                                || path.starts_with("/v1/kv/watch")
+                            {
                                 "no-cache"
                             } else if path.starts_with("/v1/") {
                                 "public, max-age=5"

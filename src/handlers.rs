@@ -10,6 +10,7 @@ use std::time::Duration;
 
 const THROTTLE_CLEANUP_THRESHOLD: usize = 1_000;
 const THROTTLE_EXPIRY: Duration = Duration::from_secs(600); // 10 minutes
+const MAX_THROTTLE_ENTRIES: usize = 50_000;
 
 pub(crate) async fn require_db(
     state: &AppState,
@@ -19,7 +20,7 @@ pub(crate) async fn require_db(
         return Err(ApiError::DatabaseUnavailable);
     }
     Ok(RwLockReadGuard::map(guard, |opt| {
-        opt.as_ref().expect("guarded by is_none check above")
+        opt.as_deref().expect("guarded by is_none check above")
     }))
 }
 
@@ -167,7 +168,7 @@ fn extract_client_ip(req: &HttpRequest) -> String {
     req.headers()
         .get("X-Forwarded-For")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.rsplit(',').next())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && *s != "unknown")
         .map(|s| s.to_string())
@@ -200,6 +201,11 @@ fn check_scan_throttle(app_state: &AppState, ip: &str) -> Result<(), ApiError> {
                 "Too many scan requests. Try again shortly.".to_string(),
             ));
         }
+    }
+    if throttle.len() >= MAX_THROTTLE_ENTRIES {
+        return Err(ApiError::TooManyRequests(
+            "Too many scan requests. Try again shortly.".to_string(),
+        ));
     }
     throttle.insert(ip.to_string(), now);
     Ok(())
@@ -363,10 +369,6 @@ pub async fn query_kv_handler(
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
-/// Get historical versions of a KV entry
-///
-/// Scans up to 10,000 rows; `meta.truncated` is true if the cap was hit.
-/// Paginate using `from_block`/`to_block` range narrowing + `limit`.
 #[utoipa::path(
     get,
     path = "/v1/kv/history",
@@ -387,10 +389,13 @@ pub async fn history_kv_handler(
     validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     validate_limit(query.limit)?;
-    validate_offset(query.offset)?;
-
     validate_order(&query.order)?;
     validate_block_range(query.from_block, query.to_block)?;
+    if let Some(ref c) = query.cursor {
+        if !c.is_empty() {
+            parse_history_cursor(c)?;
+        }
+    }
 
     tracing::info!(
         target: PROJECT_ID,
@@ -398,7 +403,7 @@ pub async fn history_kv_handler(
         contractId = %query.current_account_id,
         key = %query.key,
         limit = query.limit,
-        offset = query.offset,
+        cursor = ?query.cursor,
         order = %query.order,
         from_block = ?query.from_block,
         to_block = ?query.to_block,
@@ -406,12 +411,11 @@ pub async fn history_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more, truncated, dropped) = db.get_kv_history(&query).await?;
+    let (entries, has_more, dropped, next_cursor) = db.get_kv_history(&query).await?;
 
-    let next_cursor = entries.last().map(|e| e.block_height.to_string());
     let meta = PaginationMeta {
         has_more,
-        truncated,
+        truncated: false,
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
@@ -636,13 +640,18 @@ pub async fn contracts_handler(
         db.query_contracts_by_account(account_id, limit, query.after_contract.as_deref())
             .await?
     } else {
+        if query.scan != Some(1) {
+            return Err(ApiError::InvalidParameter(
+                "accountId: required unless scan=1".to_string(),
+            ));
+        }
         check_scan_throttle(&app_state, &extract_client_ip(&req))?;
 
         tracing::info!(
             target: PROJECT_ID,
             limit = limit,
             after_contract = ?query.after_contract,
-            "GET /v1/kv/contracts"
+            "GET /v1/kv/contracts (scan)"
         );
 
         db.query_all_contracts(limit, query.after_contract.as_deref())
@@ -737,10 +746,6 @@ pub async fn diff_kv_handler(
     }
 }
 
-/// All writes by one account across all keys, ordered by block_height
-///
-/// Scans up to 10,000 rows; `meta.truncated` is true if the cap was hit.
-/// `from_block`/`to_block` are filtered in-memory (not CQL pushdown).
 #[utoipa::path(
     get,
     path = "/v1/kv/timeline",
@@ -760,17 +765,20 @@ pub async fn timeline_kv_handler(
     validate_account_id(&query.predecessor_id, "accountId")?;
     validate_account_id(&query.current_account_id, "contractId")?;
     validate_limit(query.limit)?;
-    validate_offset(query.offset)?;
-
     validate_order(&query.order)?;
     validate_block_range(query.from_block, query.to_block)?;
+    if let Some(ref c) = query.cursor {
+        if !c.is_empty() {
+            parse_timeline_cursor(c)?;
+        }
+    }
 
     tracing::info!(
         target: PROJECT_ID,
         accountId = %query.predecessor_id,
         contractId = %query.current_account_id,
         limit = query.limit,
-        offset = query.offset,
+        cursor = ?query.cursor,
         order = %query.order,
         from_block = ?query.from_block,
         to_block = ?query.to_block,
@@ -778,12 +786,11 @@ pub async fn timeline_kv_handler(
     );
 
     let db = require_db(&app_state).await?;
-    let (entries, has_more, truncated, dropped) = db.get_kv_timeline(&query).await?;
+    let (entries, has_more, dropped, next_cursor) = db.get_kv_timeline(&query).await?;
 
-    let next_cursor = entries.last().map(|e| e.block_height.to_string());
     let meta = PaginationMeta {
         has_more,
-        truncated,
+        truncated: false,
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
@@ -1019,18 +1026,25 @@ pub async fn watch_kv_handler(
 
     let poll_secs = query.interval.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
 
-    // Check concurrent watch limit
-    let current = app_state
+    // Atomically claim a watch slot; rollback if over limit
+    let prev = app_state
         .watch_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if current >= MAX_CONCURRENT_WATCHES {
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prev >= MAX_CONCURRENT_WATCHES {
+        app_state
+            .watch_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         return Err(ApiError::TooManyRequests(
             "Too many active watch connections".to_string(),
         ));
     }
 
-    // Verify DB is available
-    let _ = require_db(&app_state).await?;
+    // Verify DB is available (rollback slot on failure)
+    let _ = require_db(&app_state).await.inspect_err(|_| {
+        app_state
+            .watch_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    })?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -1054,8 +1068,6 @@ pub async fn watch_kv_handler(
     let current_account_id = query.current_account_id.clone();
     let key = query.key.clone();
 
-    watch_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     let stream = async_stream::stream! {
         let mut last_known_block = last_block.unwrap_or(0);
         let mut poll_interval = tokio::time::interval(Duration::from_secs(poll_secs));
@@ -1065,8 +1077,10 @@ pub async fn watch_kv_handler(
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
-                    let guard = scylladb.read().await;
-                    if let Some(db) = guard.as_ref() {
+                    // Clone the Arc and drop the guard before awaiting DB call,
+                    // so the RwLock is not held across .await (blocks reconnection).
+                    let db = scylladb.read().await.clone();
+                    if let Some(ref db) = db {
                         match db.get_kv(&predecessor_id, &current_account_id, &key).await {
                             Ok(Some(entry)) if entry.block_height > last_known_block => {
                                 last_known_block = entry.block_height;

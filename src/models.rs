@@ -13,7 +13,6 @@ pub const MAX_BATCH_KEY_LENGTH: usize = 1024;
 pub const MAX_SOCIAL_RESULTS: usize = 1000;
 pub const MAX_SOCIAL_KEYS: usize = 100;
 pub const MAX_STREAM_ERRORS: usize = 10;
-pub const MAX_HISTORY_SCAN: usize = 10_000;
 pub const MAX_DEDUP_SCAN: usize = 100_000;
 pub const MAX_EDGE_TYPE_LENGTH: usize = 256;
 pub const MAX_SCAN_LIMIT: usize = 1000;
@@ -336,6 +335,39 @@ pub fn should_decode(value_format: &Option<String>) -> Result<bool, ApiError> {
     }
 }
 
+pub fn parse_history_cursor(cursor: &str) -> Result<(i64, i64), ApiError> {
+    let (bh_str, oid_str) = cursor.split_once(':').ok_or_else(|| {
+        ApiError::InvalidParameter("cursor: expected format block_height:order_id".to_string())
+    })?;
+    let block_height: i64 = bh_str.parse().map_err(|_| {
+        ApiError::InvalidParameter("cursor: block_height must be a non-negative integer".to_string())
+    })?;
+    let order_id: i64 = oid_str.parse().map_err(|_| {
+        ApiError::InvalidParameter("cursor: order_id must be an integer".to_string())
+    })?;
+    if block_height < 0 {
+        return Err(ApiError::InvalidParameter(
+            "cursor: block_height must be non-negative".to_string(),
+        ));
+    }
+    Ok((block_height, order_id))
+}
+
+pub fn parse_timeline_cursor(cursor: &str) -> Result<(i64, String), ApiError> {
+    let (bh_str, key) = cursor.split_once(':').ok_or_else(|| {
+        ApiError::InvalidParameter("cursor: expected format block_height:key".to_string())
+    })?;
+    let block_height: i64 = bh_str.parse().map_err(|_| {
+        ApiError::InvalidParameter("cursor: block_height must be a non-negative integer".to_string())
+    })?;
+    if block_height < 0 {
+        return Err(ApiError::InvalidParameter(
+            "cursor: block_height must be non-negative".to_string(),
+        ));
+    }
+    Ok((block_height, key.to_string()))
+}
+
 pub fn validate_limit(limit: usize) -> Result<(), ApiError> {
     if limit == 0 || limit > 1000 {
         return Err(ApiError::InvalidParameter(
@@ -404,7 +436,6 @@ fn default_limit() -> usize {
     100
 }
 
-// History query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct HistoryParams {
     #[serde(rename = "accountId")]
@@ -414,19 +445,18 @@ pub struct HistoryParams {
     pub key: String,
     #[serde(default = "default_history_limit")]
     pub limit: usize,
-    #[serde(default)]
-    pub offset: usize,
     #[serde(default = "default_order_desc")]
-    pub order: String, // "asc" or "desc"
+    pub order: String,
     #[serde(default)]
     pub from_block: Option<i64>,
     #[serde(default)]
     pub to_block: Option<i64>,
     #[serde(default)]
-    pub fields: Option<String>, // Comma-separated field names
-    /// Value format: "raw" (default) or "json" (decoded).
+    pub fields: Option<String>,
     #[serde(default)]
     pub value_format: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 fn default_history_limit() -> usize {
@@ -483,7 +513,7 @@ pub struct AccountsQueryParams {
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct ContractsQueryParams {
     /// Optional: list contracts this account has written to (single-partition, cheap).
-    /// When omitted, lists all contracts globally (full scan, throttled).
+    /// When omitted, lists all contracts globally (full scan, throttled, requires scan=1).
     #[serde(rename = "accountId", default)]
     pub predecessor_id: Option<String>,
     #[serde(default = "default_limit")]
@@ -491,6 +521,9 @@ pub struct ContractsQueryParams {
     /// Cursor: return contracts after this value (TOKEN-ordered when global, lexicographic when per-account).
     #[serde(default)]
     pub after_contract: Option<String>,
+    /// Must be set to 1 to enable global contract listing (when accountId is omitted).
+    #[serde(default)]
+    pub scan: Option<u8>,
 }
 
 // Diff query parameters
@@ -516,7 +549,6 @@ pub struct DiffResponse {
     pub b: Option<KvEntry>,
 }
 
-// Timeline query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct TimelineParams {
     #[serde(rename = "accountId")]
@@ -525,8 +557,6 @@ pub struct TimelineParams {
     pub current_account_id: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default)]
-    pub offset: usize,
     #[serde(default = "default_order_desc")]
     pub order: String,
     #[serde(default)]
@@ -535,9 +565,10 @@ pub struct TimelineParams {
     pub to_block: Option<i64>,
     #[serde(default)]
     pub fields: Option<String>,
-    /// Value format: "raw" (default) or "json" (decoded).
     #[serde(default)]
     pub value_format: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 // Batch query structs
@@ -1041,4 +1072,39 @@ mod tests {
         assert_eq!(json["code"], "INVALID_PARAMETER");
     }
 
+    #[test]
+    fn test_parse_history_cursor() {
+        let (bh, oid) = parse_history_cursor("139000500:3").unwrap();
+        assert_eq!(bh, 139000500);
+        assert_eq!(oid, 3);
+    }
+
+    #[test]
+    fn test_parse_history_cursor_invalid() {
+        assert!(parse_history_cursor("abc:3").is_err());
+        assert!(parse_history_cursor("123").is_err());
+        assert!(parse_history_cursor("").is_err());
+        assert!(parse_history_cursor("-1:3").is_err());
+    }
+
+    #[test]
+    fn test_parse_timeline_cursor() {
+        let (bh, key) = parse_timeline_cursor("139000500:profile/name").unwrap();
+        assert_eq!(bh, 139000500);
+        assert_eq!(key, "profile/name");
+    }
+
+    #[test]
+    fn test_parse_timeline_cursor_colon_in_key() {
+        let (bh, key) = parse_timeline_cursor("100:key:with:colons").unwrap();
+        assert_eq!(bh, 100);
+        assert_eq!(key, "key:with:colons");
+    }
+
+    #[test]
+    fn test_parse_timeline_cursor_invalid() {
+        assert!(parse_timeline_cursor("abc:key").is_err());
+        assert!(parse_timeline_cursor("123").is_err());
+        assert!(parse_timeline_cursor("-1:key").is_err());
+    }
 }

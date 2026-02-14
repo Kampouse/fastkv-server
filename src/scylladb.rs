@@ -5,10 +5,8 @@ use scylla::statement::prepared::PreparedStatement;
 
 use crate::models::{
     bigint_to_u64, AccountsParams, ContractAccountRow, ContractRow, EdgeRow, EdgeSourceEntry,
-    HistoryParams,
-    KvEntry, KvHistoryRow, KvRow, KvTimelineRow, QueryParams, TimelineParams, WritersParams,
-    MAX_DEDUP_SCAN,
-    MAX_HISTORY_SCAN,
+    HistoryParams, KvEntry, KvHistoryRow, KvRow, KvTimelineRow, QueryParams, TimelineParams,
+    WritersParams, MAX_DEDUP_SCAN,
 };
 use fastnear_primitives::types::ChainId;
 use futures::stream::StreamExt;
@@ -137,9 +135,11 @@ pub struct ScyllaDb {
     pub(crate) reverse_kv: PreparedStatement,
     reverse_list: PreparedStatement,
     reverse_list_cursor: PreparedStatement,
-    get_kv_history: PreparedStatement,
+    history_asc: PreparedStatement,
+    history_desc: PreparedStatement,
     get_kv_at_block: PreparedStatement,
-    get_kv_timeline: PreparedStatement,
+    timeline_asc: PreparedStatement,
+    timeline_desc: PreparedStatement,
     accounts_by_contract: PreparedStatement,
     accounts_by_contract_key: PreparedStatement,
     accounts_all: PreparedStatement,
@@ -320,9 +320,14 @@ impl ScyllaDb {
                 &format!("SELECT {} FROM {} WHERE current_account_id = ? AND key = ? AND predecessor_id > ?", columns, kv_reverse_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
-            get_kv_history: Self::prepare_query(
+            history_asc: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ? AND block_height >= ? AND block_height <= ?", history_columns, history_table_name),
+                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ? AND block_height >= ? AND block_height <= ? ORDER BY block_height ASC, order_id ASC", history_columns, history_table_name),
+                scylla::frame::types::Consistency::LocalOne,
+            ).await?,
+            history_desc: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ? AND block_height >= ? AND block_height <= ? ORDER BY block_height DESC, order_id DESC", history_columns, history_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             get_kv_at_block: Self::prepare_query(
@@ -330,9 +335,14 @@ impl ScyllaDb {
                 &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ? AND key = ? AND block_height = ?", history_columns, history_table_name),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
-            get_kv_timeline: Self::prepare_query(
+            timeline_desc: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM s_kv_by_block WHERE predecessor_id = ? AND current_account_id = ? AND block_height >= ? AND block_height <= ?", timeline_columns),
+                &format!("SELECT {} FROM s_kv_by_block WHERE predecessor_id = ? AND current_account_id = ? AND block_height >= ? AND block_height <= ? ORDER BY block_height DESC, key ASC", timeline_columns),
+                scylla::frame::types::Consistency::LocalOne,
+            ).await?,
+            timeline_asc: Self::prepare_query(
+                &scylla_session,
+                &format!("SELECT {} FROM s_kv_by_block WHERE predecessor_id = ? AND current_account_id = ? AND block_height >= ? AND block_height <= ? ORDER BY block_height ASC, key DESC", timeline_columns),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             // LocalQuorum for kv_accounts: this table is populated asynchronously so
@@ -910,47 +920,76 @@ impl ScyllaDb {
         Ok(entry)
     }
 
-    /// Returns (entries, has_more, truncated, dropped_rows).
-    /// Uses `s_kv_by_block` table with CQL block-height pushdown.
     pub async fn get_kv_timeline(
         &self,
         params: &TimelineParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
-        let from_block = params.from_block.unwrap_or(0);
-        let to_block = params.to_block.unwrap_or(i64::MAX);
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, usize, Option<String>)> {
+        let is_asc = params.order.eq_ignore_ascii_case("asc");
+
+        let cursor = match &params.cursor {
+            Some(c) if !c.is_empty() => {
+                let (cb, ck) = crate::models::parse_timeline_cursor(c)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Some((cb, ck))
+            }
+            _ => None,
+        };
+
+        let mut from_block = params.from_block.unwrap_or(0);
+        let mut to_block = params.to_block.unwrap_or(i64::MAX);
+        if let Some((cb, _)) = &cursor {
+            if is_asc {
+                from_block = from_block.max(*cb);
+            } else {
+                to_block = to_block.min(*cb);
+            }
+        }
+
+        let stmt = if is_asc {
+            self.timeline_asc.clone()
+        } else {
+            self.timeline_desc.clone()
+        };
 
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
-                self.get_kv_timeline.clone(),
-                (
-                    &params.predecessor_id,
-                    &params.current_account_id,
-                    from_block,
-                    to_block,
-                ),
+                stmt,
+                (&params.predecessor_id, &params.current_account_id, from_block, to_block),
             )
             .await?
             .rows_stream::<KvTimelineRow>()?;
 
-        let mut page = collect_page(
+        let page = collect_page(
             &mut rows_stream,
             params.limit,
             0,
-            Some(MAX_HISTORY_SCAN),
-            |row: KvTimelineRow| Some(KvEntry::from(row)),
+            None,
+            |row: KvTimelineRow| {
+                if let Some((cb, ref ck)) = cursor {
+                    if row.block_height == cb {
+                        if is_asc {
+                            if row.key.as_str() >= ck.as_str() {
+                                return None;
+                            }
+                        } else if row.key.as_str() <= ck.as_str() {
+                            return None;
+                        }
+                    }
+                }
+                let key = row.key.clone();
+                Some((KvEntry::from(row), key))
+            },
         )
         .await;
 
-        // Post-sort (scan-cap mode collects all, caller sorts + slices)
-        sort_by_block_height(&mut page.items, params.order.eq_ignore_ascii_case("asc"));
+        let next_cursor = page
+            .items
+            .last()
+            .map(|(e, key)| format!("{}:{key}", e.block_height));
+        let entries: Vec<KvEntry> = page.items.into_iter().map(|(e, _)| e).collect();
 
-        let result: Vec<KvEntry> = page.items.into_iter().skip(params.offset).collect();
-        let has_more = result.len() > params.limit;
-        let mut result = result;
-        result.truncate(params.limit);
-
-        Ok((result, has_more, page.truncated, page.dropped_rows))
+        Ok((entries, page.has_more, page.dropped_rows, next_cursor))
     }
 
     /// Returns (entries, has_more, dropped_rows).
@@ -1010,18 +1049,41 @@ impl ScyllaDb {
         Ok(count)
     }
 
-    /// Returns (entries, has_more, truncated, dropped_rows).
     pub async fn get_kv_history(
         &self,
         params: &HistoryParams,
-    ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
-        let from_block = params.from_block.unwrap_or(0);
-        let to_block = params.to_block.unwrap_or(i64::MAX);
+    ) -> anyhow::Result<(Vec<KvEntry>, bool, usize, Option<String>)> {
+        let is_asc = params.order.eq_ignore_ascii_case("asc");
+
+        let cursor = match &params.cursor {
+            Some(c) if !c.is_empty() => {
+                let (cb, co) = crate::models::parse_history_cursor(c)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Some((cb, co))
+            }
+            _ => None,
+        };
+
+        let mut from_block = params.from_block.unwrap_or(0);
+        let mut to_block = params.to_block.unwrap_or(i64::MAX);
+        if let Some((cb, _)) = cursor {
+            if is_asc {
+                from_block = from_block.max(cb);
+            } else {
+                to_block = to_block.min(cb);
+            }
+        }
+
+        let stmt = if is_asc {
+            self.history_asc.clone()
+        } else {
+            self.history_desc.clone()
+        };
 
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
-                self.get_kv_history.clone(),
+                stmt,
                 (
                     &params.predecessor_id,
                     &params.current_account_id,
@@ -1033,25 +1095,36 @@ impl ScyllaDb {
             .await?
             .rows_stream::<KvHistoryRow>()?;
 
-        let mut page = collect_page(
+        let page = collect_page(
             &mut rows_stream,
             params.limit,
             0,
-            Some(MAX_HISTORY_SCAN),
-            |row: KvHistoryRow| Some(KvEntry::from(row)),
+            None,
+            |row: KvHistoryRow| {
+                if let Some((cb, co)) = cursor {
+                    if row.block_height == cb {
+                        if is_asc {
+                            if row.order_id <= co {
+                                return None;
+                            }
+                        } else if row.order_id >= co {
+                            return None;
+                        }
+                    }
+                }
+                let oid = row.order_id;
+                Some((KvEntry::from(row), oid))
+            },
         )
         .await;
 
-        // Post-sort (scan-cap mode collects all, caller sorts + slices)
-        sort_by_block_height(&mut page.items, params.order.eq_ignore_ascii_case("asc"));
+        let next_cursor = page
+            .items
+            .last()
+            .map(|(e, oid)| format!("{}:{oid}", e.block_height));
+        let entries: Vec<KvEntry> = page.items.into_iter().map(|(e, _)| e).collect();
 
-        // Apply offset after sort (same pattern as timeline)
-        let result: Vec<KvEntry> = page.items.into_iter().skip(params.offset).collect();
-        let has_more = result.len() > params.limit;
-        let mut result = result;
-        result.truncate(params.limit);
-
-        Ok((result, has_more, page.truncated, page.dropped_rows))
+        Ok((entries, page.has_more, page.dropped_rows, next_cursor))
     }
 
     pub async fn get_indexer_block_height(&self) -> anyhow::Result<Option<u64>> {
@@ -1077,16 +1150,6 @@ fn compute_prefix_end(prefix: &str) -> String {
 
 fn effective_offset(cursor: Option<&str>, offset: usize) -> usize {
     if cursor.is_some() { 0 } else { offset }
-}
-
-fn sort_by_block_height(entries: &mut [KvEntry], is_asc: bool) {
-    entries.sort_by(|a, b| {
-        if is_asc {
-            a.block_height.cmp(&b.block_height)
-        } else {
-            b.block_height.cmp(&a.block_height)
-        }
-    });
 }
 
 #[cfg(test)]

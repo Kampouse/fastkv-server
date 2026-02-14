@@ -30,11 +30,11 @@
 | `/v1/kv/get`         | GET    | `get_kv_handler`      | `s_kv_last`                    | Cheap          | `WHERE predecessor_id=? AND current_account_id=? AND key=?`                                                                                                                                  |
 | `/v1/kv/batch`       | POST   | `batch_kv_handler`    | `s_kv_last`                    | Cheap          | N parallel PK lookups (max 100, 10 concurrent)                                                                                                                                               |
 | `/v1/kv/query`       | GET    | `query_kv_handler`    | `s_kv_last`                    | Moderate       | `WHERE ... AND key >= ? AND key < ?` (prefix). **Risky** without `key_prefix` (full partition)                                                                                               |
-| `/v1/kv/history`     | GET    | `history_kv_handler`  | `s_kv`                         | Cheap          | `WHERE ... AND key=? AND block_height >= ? AND block_height <= ?` (CQL pushdown)                                                                                                             |
+| `/v1/kv/history`     | GET    | `history_kv_handler`  | `s_kv`                         | Cheap          | `WHERE ... AND key=? AND block_height >= ? AND block_height <= ? ORDER BY block_height {ASC\|DESC}` — cursor-based overfetch pagination                                                      |
 | `/v1/kv/writers`     | GET    | `writers_handler`     | `kv_reverse`                   | Moderate       | `WHERE current_account_id=? AND key=?` — streams partition (no dedup needed)                                                                                                                 |
 | `/v1/kv/accounts`    | GET    | `accounts_handler`    | `kv_accounts` / `all_accounts` | Cheap/Risky    | Cheap with `key` param (PK+CK). **Risky** without `key` (full partition + 100k dedup). Without `contractId` (`scan=1`): reads `all_accounts` table with TOKEN cursor, throttled 1 req/sec/IP |
 | `/v1/kv/diff`        | GET    | `diff_kv_handler`     | `s_kv`                         | Moderate       | 2 parallel PK+CK lookups at exact block heights                                                                                                                                              |
-| `/v1/kv/timeline`    | GET    | `timeline_kv_handler` | `s_kv_by_block`                | Moderate       | `WHERE predecessor_id=? AND current_account_id=? AND block_height >= ? AND block_height <= ?` — CQL pushdown, 10k row cap                                                                   |
+| `/v1/kv/timeline`    | GET    | `timeline_kv_handler` | `s_kv_by_block`                | Moderate       | `WHERE predecessor_id=? AND current_account_id=? AND block_height >= ? AND block_height <= ? ORDER BY block_height {ASC\|DESC}` — cursor-based overfetch pagination                          |
 | `/v1/kv/edges`       | GET    | `edges_handler`       | `kv_edges`                     | Moderate/Risky | Moderate with `after_source` cursor (`source > ?`). Risky without cursor (full partition + offset)                                                                                           |
 | `/v1/kv/edges/count` | GET    | `edges_count_handler` | `kv_edges`                     | Expensive      | `SELECT COUNT(*) WHERE edge_type=? AND target=?` — scans entire partition                                                                                                                    |
 | `/v1/kv/watch`       | GET    | `watch_kv_handler`    | `s_kv_last`                    | Cheap (per poll) | SSE stream. Polls `get_kv` every 2–30s. Returns `text/event-stream`. Max 100 concurrent connections.                                                                                       |
@@ -110,23 +110,25 @@ Returns `DataResponse<KvEntry | null>`.
 
 Returns `PaginatedResponse<KvEntry>` or `TreeResponse` (if `format=tree`).
 
+> **Note:** `format=tree` does not support cursor pagination. Use the default format for paginated results.
+
 ### GET /v1/kv/history
 
-| Param          | Type   | Required | Default  | Notes                                         |
-| -------------- | ------ | -------- | -------- | --------------------------------------------- |
-| `accountId`    | string | yes      |          | Writer account                                |
-| `contractId`   | string | yes      |          | Contract account                              |
-| `key`          | string | yes      |          | KV key                                        |
-| `limit`        | int    | no       | 100      | Range 1–1000                                  |
-| `offset`       | int    | no       | 0        | Max 100,000. Applied in-memory after sort.    |
-| `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                           |
-| `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0) |
-| `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0) |
-| `fields`       | string | no       |          | Comma-separated field filter                  |
-| `value_format` | string | no       | `"raw"`  | `"raw"` or `"json"` (decoded)                 |
+| Param          | Type   | Required | Default  | Notes                                                                 |
+| -------------- | ------ | -------- | -------- | --------------------------------------------------------------------- |
+| `accountId`    | string | yes      |          | Writer account                                                        |
+| `contractId`   | string | yes      |          | Contract account                                                      |
+| `key`          | string | yes      |          | KV key                                                                |
+| `limit`        | int    | no       | 100      | Range 1–1000                                                          |
+| `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                                                   |
+| `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0)                         |
+| `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0)                         |
+| `cursor`       | string | no       |          | Resume token from `meta.next_cursor`. Format: `block_height:order_id` |
+| `fields`       | string | no       |          | Comma-separated field filter                                          |
+| `value_format` | string | no       | `"raw"`  | `"raw"` or `"json"` (decoded)                                         |
 
-Returns `PaginatedResponse<KvEntry>`. `meta.truncated: true` if scan hit 10,000 rows.
-Paginate using `from_block`/`to_block` range narrowing + `limit`.
+Returns `PaginatedResponse<KvEntry>`. Uses CQL `ORDER BY` with cursor-based overfetch pagination.
+`cursor` coexists with `from_block`/`to_block` — the cursor adjusts the effective range bound.
 
 ### GET /v1/kv/writers
 
@@ -174,19 +176,20 @@ Returns `DataResponse<DiffResponse>`.
 
 ### GET /v1/kv/timeline
 
-| Param          | Type   | Required | Default  | Notes                                            |
-| -------------- | ------ | -------- | -------- | ------------------------------------------------ |
-| `accountId`    | string | yes      |          | Writer account                                   |
-| `contractId`   | string | yes      |          | Contract account                                 |
-| `limit`        | int    | no       | 100      | Range 1–1000                                     |
-| `offset`       | int    | no       | 0        | Max 100,000                                      |
-| `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                              |
-| `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0)    |
-| `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0)    |
-| `fields`       | string | no       |          | Comma-separated field filter                     |
-| `value_format` | string | no       | `"raw"`  | `"raw"` or `"json"` (decoded)                    |
+| Param          | Type   | Required | Default  | Notes                                                            |
+| -------------- | ------ | -------- | -------- | ---------------------------------------------------------------- |
+| `accountId`    | string | yes      |          | Writer account                                                   |
+| `contractId`   | string | yes      |          | Contract account                                                 |
+| `limit`        | int    | no       | 100      | Range 1–1000                                                     |
+| `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                                              |
+| `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0)                    |
+| `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0)                    |
+| `cursor`       | string | no       |          | Resume token from `meta.next_cursor`. Format: `block_height:key` |
+| `fields`       | string | no       |          | Comma-separated field filter                                     |
+| `value_format` | string | no       | `"raw"`  | `"raw"` or `"json"` (decoded)                                    |
 
-Returns `PaginatedResponse<KvEntry>`. `meta.truncated: true` if scan hit 10,000 rows.
+Returns `PaginatedResponse<KvEntry>`. Uses CQL `ORDER BY` with cursor-based overfetch pagination.
+`cursor` coexists with `from_block`/`to_block` — the cursor adjusts the effective range bound.
 
 ### GET /v1/kv/accounts
 
@@ -273,7 +276,7 @@ Request body:
 }
 ```
 
-Returns nested JSON structure. Sets `X-Results-Truncated: true` header if any pattern hit 1,000-result limit.
+Returns nested JSON structure. Results capped at 1,000 entries per pattern. Sets `X-Results-Truncated: true` header when truncated. No cursor pagination for social endpoints.
 
 **Key pattern types:**
 
@@ -372,11 +375,11 @@ All paginated endpoints return `PaginatedResponse<T>` with a `meta` object:
 }
 ```
 
-**`meta.has_more`** — Authoritative for cursor+limit endpoints (query, writers, edges, followers, following) which use the limit+1 overfetch pattern. Best-effort for scan-limited endpoints (history, timeline, accounts) where a scan cap may prevent full enumeration.
+**`meta.has_more`** — Authoritative for cursor+limit endpoints (query, writers, edges, history, timeline, followers, following) which use the limit+1 overfetch pattern. Best-effort for scan-limited endpoints (accounts) where a scan cap may prevent full enumeration.
 
-**`meta.next_cursor`** — Always set when items are returned, regardless of `has_more`. Use as the resume point for the next page via the corresponding `after_*` parameter.
+**`meta.next_cursor`** — Always set when items are returned, regardless of `has_more`. Use as the resume point for the next page via `cursor` (history, timeline) or the corresponding `after_*` parameter.
 
-**`meta.truncated`** — True only when a scan/dedup cap was hit: 10,000 rows for history/timeline, 100,000 unique values for accounts. Omitted when false (`default: false` in OpenAPI schema). When true, `has_more` may be inaccurate — treat completion as unknown.
+**`meta.truncated`** — True only when a scan/dedup cap was hit: 100,000 unique values for accounts. Omitted when false (`default: false` in OpenAPI schema). When true, `has_more` may be inaccurate — treat completion as unknown.
 
 **`meta.dropped_rows`** — Number of rows skipped due to deserialization errors. Omitted when zero. Nonzero means the results are complete for the requested page but some rows in the underlying data could not be read. This is a data-quality signal, not a pagination issue — clients do not need to retry. All paginated endpoints (KV and social) report this in the JSON body.
 
@@ -395,10 +398,7 @@ Valid codes: `INVALID_PARAMETER` (400), `DATABASE_ERROR` (500), `DATABASE_UNAVAI
 
 **Client rule** — Stop paginating when `meta.has_more == false` and `meta.truncated != true`. If `truncated` is true, the client may continue via `next_cursor` but should treat the dataset as potentially incomplete.
 
-**History/timeline pagination** — These endpoints have no `after_*` cursor. Paginate by narrowing the block range:
-
-- Descending: set `to_block` to `last_returned_block_height - 1` for the next page
-- Ascending: set `from_block` to `last_returned_block_height + 1` for the next page
+**History/timeline pagination** — Use `cursor` param with `meta.next_cursor` from the previous page. Cursor format: `block_height:order_id` (history) or `block_height:key` (timeline). `cursor` coexists with `from_block`/`to_block` — the cursor adjusts the effective range bound to skip already-seen rows.
 
 ---
 
@@ -538,10 +538,10 @@ interface HistoryParams {
   contractId: string;
   key: string;
   limit?: number; // default 100, max 1000
-  offset?: number; // default 0, max 100_000
   order?: "asc" | "desc"; // default "desc"
   from_block?: number;
   to_block?: number;
+  cursor?: string; // format: "block_height:order_id"
   fields?: string;
   value_format?: "raw" | "json";
 }
@@ -581,10 +581,10 @@ interface TimelineParams {
   accountId: string;
   contractId: string;
   limit?: number;
-  offset?: number;
   order?: "asc" | "desc";
   from_block?: number;
   to_block?: number;
+  cursor?: string; // format: "block_height:key"
   fields?: string;
   value_format?: "raw" | "json";
 }
@@ -753,7 +753,6 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 | `MAX_SOCIAL_RESULTS`    | 1,000   | `models.rs` | Per-pattern result cap for social endpoints      |
 | `MAX_SOCIAL_KEYS`       | 100     | `models.rs` | Max patterns per social request                  |
 | `MAX_STREAM_ERRORS`     | 10      | `models.rs` | Deserialization error cap before aborting stream |
-| `MAX_HISTORY_SCAN`      | 10,000  | `models.rs` | Row cap for history/timeline scans               |
 | `MAX_DEDUP_SCAN`        | 100,000 | `models.rs` | Unique-value cap for dedup scans                 |
 | `MAX_EDGE_TYPE_LENGTH`  | 256     | `models.rs` | Max chars for edge_type param                    |
 
@@ -761,22 +760,24 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 
 ## Prepared Statements
 
-20 statements prepared at startup. All use `LocalOne` consistency and 10s timeout unless noted.
+22 statements prepared at startup. All use `LocalOne` consistency and 10s timeout unless noted.
 
-| Name                       | Table           | CQL Summary                                          | Used By                                          |
-| -------------------------- | --------------- | ---------------------------------------------------- | ------------------------------------------------ |
-| `get_kv`                   | `s_kv_last`     | PK lookup (3-col)                                    | `/kv/get`                                        |
-| `get_kv_last`              | `s_kv_last`     | Value-only PK lookup                                 | `/kv/batch`                                      |
-| `query_kv_no_prefix`       | `s_kv_last`     | Full partition (2-col PK)                            | `/kv/query` (no prefix)                          |
-| `query_kv_cursor`          | `s_kv_last`     | `key > ?` (cursor, no prefix)                        | `/kv/query` (cursor, no prefix)                  |
-| `prefix_query`             | `s_kv_last`     | `key >= ? AND key < ?`                               | `/kv/query` (prefix, no cursor)                  |
-| `prefix_cursor_query`      | `s_kv_last`     | `key > ? AND key < ?`                                | `/kv/query` (prefix + cursor)                    |
-| `reverse_kv`               | `mv_kv_cur_key` | PK + ORDER BY DESC                                   | social index, social get/keys (wildcard account) |
-| `reverse_list`             | `kv_reverse`    | Full partition (2-col PK)                            | `/kv/writers` (no cursor)                        |
-| `reverse_list_cursor`      | `kv_reverse`    | PK + `predecessor_id > ?`                            | `/kv/writers` (with cursor)                      |
-| `get_kv_history`           | `s_kv`          | PK + `block_height >= ? AND <= ?`                    | `/kv/history`, `/social/feed/account`            |
-| `get_kv_at_block`          | `s_kv`          | PK + exact block                                     | `/kv/diff`                                       |
-| `get_kv_timeline`          | `s_kv_by_block` | PK + `block_height >= ? AND <= ?`                    | `/kv/timeline`                                   |
+| Name                       | Table           | CQL Summary                                                         | Used By                                          |
+| -------------------------- | --------------- | ------------------------------------------------------------------- | ------------------------------------------------ |
+| `get_kv`                   | `s_kv_last`     | PK lookup (3-col)                                                   | `/kv/get`                                        |
+| `get_kv_last`              | `s_kv_last`     | Value-only PK lookup                                                | `/kv/batch`                                      |
+| `query_kv_no_prefix`       | `s_kv_last`     | Full partition (2-col PK)                                           | `/kv/query` (no prefix)                          |
+| `query_kv_cursor`          | `s_kv_last`     | `key > ?` (cursor, no prefix)                                       | `/kv/query` (cursor, no prefix)                  |
+| `prefix_query`             | `s_kv_last`     | `key >= ? AND key < ?`                                              | `/kv/query` (prefix, no cursor)                  |
+| `prefix_cursor_query`      | `s_kv_last`     | `key > ? AND key < ?`                                               | `/kv/query` (prefix + cursor)                    |
+| `reverse_kv`               | `mv_kv_cur_key` | PK + ORDER BY DESC                                                  | social index, social get/keys (wildcard account) |
+| `reverse_list`             | `kv_reverse`    | Full partition (2-col PK)                                           | `/kv/writers` (no cursor)                        |
+| `reverse_list_cursor`      | `kv_reverse`    | PK + `predecessor_id > ?`                                           | `/kv/writers` (with cursor)                      |
+| `history_desc`             | `s_kv`          | PK + `block_height >= ? AND <= ?` ORDER BY block_height DESC        | `/kv/history` (desc), `/social/feed/account`     |
+| `history_asc`              | `s_kv`          | PK + `block_height >= ? AND <= ?` ORDER BY block_height ASC         | `/kv/history` (asc)                              |
+| `get_kv_at_block`          | `s_kv`          | PK + exact block                                                    | `/kv/diff`                                       |
+| `timeline_desc`            | `s_kv_by_block` | PK + `block_height >= ? AND <= ?` ORDER BY block_height DESC        | `/kv/timeline` (desc)                            |
+| `timeline_asc`             | `s_kv_by_block` | PK + `block_height >= ? AND <= ?` ORDER BY block_height ASC         | `/kv/timeline` (asc)                             |
 | `accounts_by_contract`     | `kv_accounts`   | Full partition (**LocalQuorum**)                     | `/kv/accounts` (no key)                          |
 | `accounts_by_contract_key` | `kv_accounts`   | PK+CK lookup (**LocalQuorum**)                       | `/kv/accounts` (with key)                        |
 | `accounts_all`             | `all_accounts`  | Full table scan (**LocalQuorum**)                    | `/kv/accounts` (scan=1, no cursor)               |
@@ -795,7 +796,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 | Endpoint                                    | Risk                                            | Trigger                       | Mitigation                                 |
 | ------------------------------------------- | ----------------------------------------------- | ----------------------------- | ------------------------------------------ |
 | `/v1/kv/query`                              | Full partition scan                             | Missing `key_prefix`          | Always provide `key_prefix`                |
-| `/v1/kv/timeline`                           | CQL-filtered scan + sort                        | Wide block range or no filter | Capped at 10,000 rows (`truncated: true`)  |
+| `/v1/kv/timeline`                           | CQL-filtered partition scan                     | Wide block range or no filter | Use `from_block`/`to_block` + cursor       |
 | `/v1/kv/accounts` (contract)                | Full partition + 100k dedup                     | Missing `key` param           | Always provide `key`                       |
 | `/v1/kv/accounts` (scan)                    | Full table TOKEN scan                           | `scan=1` without `contractId` | Throttled 1 req/sec per IP, max 1000 rows  |
 | `/v1/kv/edges`                              | Full partition + offset                         | Missing `after_source` cursor | Use cursor-based pagination                |
@@ -819,7 +820,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 - **DB resilience**: Optional connection with exponential backoff reconnection (5–300s)
 - **Prefix queries prepared at startup**: `prefix_query` and `prefix_cursor_query` are prepared statements (no per-request parsing overhead)
 - **Structured error codes**: All error responses include `code` field (`INVALID_PARAMETER`, `DATABASE_ERROR`, `DATABASE_UNAVAILABLE`, `TOO_MANY_REQUESTS`)
-- **`/v1/kv/history` offset**: Applied in-memory after sort (same pattern as timeline); counts against 10,000-row scan cap
+- **`/v1/kv/history` cursor pagination**: CQL `ORDER BY` with composite cursor (`block_height:order_id`). Post-filter skip at cursor block for exact resume. Overfetch mode (limit+1).
 - **`Cache-Control` headers**: `public, max-age=5` on successful GET `/v1/*` responses; `no-cache` on `/health` and `/v1/status`
 - **SSE `/v1/kv/watch`**: Polls `get_kv` at configurable interval (2–30s); `WatchGuard` RAII decrements counter on disconnect; `Last-Event-ID` reconnection support
-- **Timeline CQL pushdown**: `/v1/kv/timeline` uses `s_kv_by_block` table with `block_height >= ? AND block_height <= ?` in CQL. `KvTimelineRow` (9 columns) deserializes from this table.
+- **Timeline cursor pagination**: `/v1/kv/timeline` uses `s_kv_by_block` table with CQL `ORDER BY` and composite cursor (`block_height:key`). `KvTimelineRow` (9 columns) deserializes from this table. Overfetch mode (limit+1).

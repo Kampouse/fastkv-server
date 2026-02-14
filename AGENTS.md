@@ -24,7 +24,7 @@ Consumer-facing docs: REFERENCE.md, runtime OpenAPI at `/docs` route.
 - **scylladb.rs**
   Owns: all DB access, prepared statements, scan caps, stream iteration, `collect_page()` helper
   Must NOT: know about HTTP, import actix_web, validate query params
-  Key pattern: `collect_page()` is a free function that handles overfetch+1 and scan-cap modes. All paginated methods return `(Vec<T>, bool, usize)` or `(Vec<T>, bool, bool, usize)` where the final `usize` is `dropped_rows`.
+  Key pattern: `collect_page()` is a free function that handles overfetch+1 and scan-cap modes. Paginated methods return `(Vec<T>, bool, usize)` (entries, has_more, dropped_rows) or `(Vec<T>, bool, usize, Option<String>)` (+ next_cursor, for history/timeline).
 
 - **models.rs**
   Owns: all request/response structs, constants, `ApiError`, serde config
@@ -98,9 +98,9 @@ pub async fn my_handler(
 
 These are load-bearing. Breaking any one breaks client pagination.
 
-1. **Overfetch by 1 (cursor endpoints).** Query `limit + 1` rows via `collect_page()` overfetch mode. Got `limit + 1` back → `has_more = true`, then truncate to `limit`. Applies to: query, writers, edges, accounts-scan. (`accounts-by-contract` uses manual overfetch with HashSet dedup, not `collect_page()`.) History/timeline use scan-cap mode instead (no overfetch; caller computes `has_more` after post-sort + slice).
+1. **Overfetch by 1 (cursor endpoints).** Query `limit + 1` rows via `collect_page()` overfetch mode. Got `limit + 1` back → `has_more = true`, then truncate to `limit`. Applies to: query, writers, edges, history, timeline, accounts-scan. (`accounts-by-contract` uses manual overfetch with HashSet dedup, not `collect_page()`.) History/timeline use cursor-based overfetch with a post-filter skip at the cursor's block_height to handle tie-breaking (rows at the same block share different order_id/key).
 2. **Always emit `next_cursor`.** Set from the last item in the result, even when `has_more == false`. Clients use `next_cursor` as the resume token.
-3. **`truncated` only from scan caps.** `truncated: true` only when a scan/dedup cap was hit (10k rows for history/timeline, 100k unique accounts for accounts-by-contract). Writers streams without a cap — `truncated` is always false there. Never set `truncated` from normal limit+1 pagination.
+3. **`truncated` only from scan caps.** `truncated: true` only when a scan/dedup cap was hit (100k unique accounts for accounts-by-contract). History, timeline, and writers never set `truncated` — they use clean cursor pagination. Never set `truncated` from normal limit+1 pagination.
 4. **`has_more` truthfulness.** Authoritative for cursor+limit endpoints. Best-effort when `truncated == true`. If `truncated` is true, treat `has_more` as unreliable; use `next_cursor` to resume.
 5. **Cursor/offset mutual exclusion.** Both `after_*` and `offset > 0` → reject with HTTP 400.
 6. **No pagination fields outside `meta`.** Never add `has_more`, `next_cursor`, or `truncated` to the top level.
@@ -134,7 +134,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 
 ## Prepared Statements
 
-- All CQL must be prepared in `ScyllaDb::new()`. No exceptions.
+- All CQL must be prepared in `ScyllaDb::new()`. No exceptions. 22 statements currently.
 - `queries.rs` owns only `compute_prefix_end()` (bind param computation, not dynamic CQL).
 - Default consistency: `LocalOne`. Exceptions require justification (see `accounts_by_contract` for `LocalQuorum`).
 - All statements get 10s request timeout via `set_request_timeout`.
@@ -142,7 +142,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 ## Hot Endpoints (Do Not Remove Safeguards)
 
 - `/v1/kv/query` without `key_prefix` — full partition scan. **Prefer `key_prefix` to narrow.**
-- `/v1/kv/timeline` — reads `s_kv_by_block` with CQL block-height pushdown, capped at 10k rows. **Use `from_block`/`to_block` to narrow (CQL-filtered, not in-memory).**
+- `/v1/kv/timeline` — reads `s_kv_by_block` with CQL `ORDER BY` + cursor-based overfetch. **Use `from_block`/`to_block` to narrow and `cursor` for pagination.**
 - `/v1/kv/accounts` without `key` — full partition scan + HashSet dedup, capped at 100k unique. **Prefer `key` filter.**
 - `/v1/kv/accounts` without `contractId` (`scan=1`) — reads `all_accounts` table (no dedup needed, TOKEN-based cursor). Throttled 1 req/sec/IP, limit clamped to 1,000. **Admin/dev only.**
 - `/v1/kv/writers` — streams entire reverse table partition (unbounded, no scan cap). **Use cursor pagination with tight `limit`.**
@@ -153,7 +153,6 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 
 | Constant             | Value   | Why it matters                                                                          |
 | -------------------- | ------- | --------------------------------------------------------------------------------------- |
-| `MAX_HISTORY_SCAN`   | 10,000  | Row cap for history/timeline. Changing affects `truncated` truthfulness and query cost. |
 | `MAX_DEDUP_SCAN`     | 100,000 | Unique-value cap for `query_accounts_by_contract` dedup HashSet. Memory-bound.          |
 | `MAX_SOCIAL_RESULTS` | 1,000   | Per-pattern cap in social handlers. Controls `X-Results-Truncated`.                     |
 | `MAX_OFFSET`         | 100,000 | Hard ceiling on offset pagination.                                                      |
@@ -165,7 +164,7 @@ Full constant list in models.rs:1–20.
 
 ## Testing Contract
 
-- `cargo test` must pass (37 unit tests)
+- `cargo test` must pass (48 unit tests)
 - `cargo clippy` must pass
 - No ScyllaDB required — unit tests cover serde, validation, tree building, prefix computation
 - Do not add integration tests without discussion (requires live DB)
@@ -177,7 +176,7 @@ Full constant list in models.rs:1–20.
 - **Do not re-add `decode` param.** It was removed. Use `value_format=json|raw` only.
 - **`/kv/timeline` uses `s_kv_by_block` table with CQL block-height pushdown.** `KvTimelineRow` (9 columns) maps to this table; do not confuse with `KvHistoryRow` (13 columns) used by `/kv/history`.
 - **Do not make `build_tree()` error on conflicts.** Leaf at "a/b" blocks nesting "a/b/c" — it skips silently. This is intentional.
-- **Do not remove scan caps** from history/timeline/accounts. They prevent unbounded partition scans in prod.
+- **Do not remove the scan cap** from accounts. It prevents unbounded partition scans in prod. History/timeline use cursor-based overfetch (no scan cap needed).
 - **Do not mix `rename` and `alias` conventions.** KV params use `#[serde(rename = "accountId")]` (one canonical form). Social params use `#[serde(alias = "accountId")]` (accept both for SocialDB compat).
 
 ## Pointers

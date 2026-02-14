@@ -50,7 +50,6 @@ function buildHash() {
     if (keyEl && keyEl.value) p.set('key', keyEl.value);
     const valEl = document.getElementById('write-value');
     if (valEl && valEl.value) p.set('value', valEl.value);
-    if (writeBatchMode) p.set('batch', '1');
   } else {
     if (contractId) p.set('contract', contractId);
     if (currentAccount) p.set('account', currentAccount);
@@ -104,11 +103,6 @@ function readHash() {
       const valEl = document.getElementById('write-value');
       if (valEl) valEl.value = val;
     }
-    if (p.get('batch') === '1' && typeof syncBatchUI === 'function') {
-      writeBatchMode = true;
-      syncBatchUI();
-    }
-    if (typeof updateWritePreview === 'function') updateWritePreview();
     setViewMode('write');
     return true;
   }

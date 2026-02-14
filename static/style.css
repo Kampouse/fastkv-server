@@ -542,29 +542,11 @@ button:focus-visible {
   padding: 0.5rem 1.2rem;
 }
 .write-connect-prompt button:hover { opacity: 0.85; }
-.write-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+.write-heading {
+  font-size: .85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
   margin-bottom: 1rem;
-}
-.write-mode-btn {
-  font-size: .7rem;
-  padding: 0.25rem 0.5rem;
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-}
-.write-mode-btn.active {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.write-note {
-  font-size: .7rem;
-  color: var(--text-muted);
-  font-family: var(--font);
-  font-style: italic;
-  margin-bottom: 0.75rem;
 }
 .write-label {
   font-size: .75rem;
@@ -580,12 +562,6 @@ button:focus-visible {
 }
 .write-field input {
   width: 100%;
-}
-.write-preview {
-  font-size: .75rem;
-  color: var(--text-muted);
-  margin-bottom: 0.75rem;
-  font-family: var(--font);
 }
 .write-btn {
   background: var(--accent);
