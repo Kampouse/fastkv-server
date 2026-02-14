@@ -6,7 +6,8 @@ use scylla::statement::prepared::PreparedStatement;
 use crate::models::{
     bigint_to_u64, AccountsParams, ContractAccountRow, ContractRow, EdgeRow, EdgeSourceEntry,
     HistoryParams,
-    KvEntry, KvHistoryRow, KvRow, QueryParams, TimelineParams, WritersParams, MAX_DEDUP_SCAN,
+    KvEntry, KvHistoryRow, KvRow, KvTimelineRow, QueryParams, TimelineParams, WritersParams,
+    MAX_DEDUP_SCAN,
     MAX_HISTORY_SCAN,
 };
 use fastnear_primitives::types::ChainId;
@@ -281,6 +282,7 @@ impl ScyllaDb {
 
         let columns = "predecessor_id, current_account_id, key, value, block_height, block_timestamp, receipt_id, tx_hash";
         let history_columns = "predecessor_id, current_account_id, key, block_height, order_id, value, block_timestamp, receipt_id, tx_hash, signer_id, shard_id, receipt_index, action_index";
+        let timeline_columns = "predecessor_id, current_account_id, block_height, key, order_id, value, block_timestamp, receipt_id, tx_hash";
 
         Ok(Self {
             get_kv: Self::prepare_query(
@@ -330,7 +332,7 @@ impl ScyllaDb {
             ).await?,
             get_kv_timeline: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT {} FROM {} WHERE predecessor_id = ? AND current_account_id = ?", history_columns, history_table_name),
+                &format!("SELECT {} FROM s_kv_by_block WHERE predecessor_id = ? AND current_account_id = ? AND block_height >= ? AND block_height <= ?", timeline_columns),
                 scylla::frame::types::Consistency::LocalOne,
             ).await?,
             // LocalQuorum for kv_accounts: this table is populated asynchronously so
@@ -909,41 +911,34 @@ impl ScyllaDb {
     }
 
     /// Returns (entries, has_more, truncated, dropped_rows).
+    /// Uses `s_kv_by_block` table with CQL block-height pushdown.
     pub async fn get_kv_timeline(
         &self,
         params: &TimelineParams,
     ) -> anyhow::Result<(Vec<KvEntry>, bool, bool, usize)> {
+        let from_block = params.from_block.unwrap_or(0);
+        let to_block = params.to_block.unwrap_or(i64::MAX);
+
         let mut rows_stream = self
             .scylla_session
             .execute_iter(
                 self.get_kv_timeline.clone(),
-                (&params.predecessor_id, &params.current_account_id),
+                (
+                    &params.predecessor_id,
+                    &params.current_account_id,
+                    from_block,
+                    to_block,
+                ),
             )
             .await?
-            .rows_stream::<KvHistoryRow>()?;
-
-        let from_block = params.from_block.map(|b| b.max(0) as u64);
-        let to_block = params.to_block.map(|b| b.max(0) as u64);
+            .rows_stream::<KvTimelineRow>()?;
 
         let mut page = collect_page(
             &mut rows_stream,
             params.limit,
             0,
             Some(MAX_HISTORY_SCAN),
-            |row: KvHistoryRow| {
-                let entry = KvEntry::from(row);
-                if let Some(fb) = from_block {
-                    if entry.block_height < fb {
-                        return None;
-                    }
-                }
-                if let Some(tb) = to_block {
-                    if entry.block_height > tb {
-                        return None;
-                    }
-                }
-                Some(entry)
-            },
+            |row: KvTimelineRow| Some(KvEntry::from(row)),
         )
         .await;
 
@@ -1050,10 +1045,13 @@ impl ScyllaDb {
         // Post-sort (scan-cap mode collects all, caller sorts + slices)
         sort_by_block_height(&mut page.items, params.order.eq_ignore_ascii_case("asc"));
 
-        let has_more = page.items.len() > params.limit;
-        page.items.truncate(params.limit);
+        // Apply offset after sort (same pattern as timeline)
+        let result: Vec<KvEntry> = page.items.into_iter().skip(params.offset).collect();
+        let has_more = result.len() > params.limit;
+        let mut result = result;
+        result.truncate(params.limit);
 
-        Ok((page.items, has_more, page.truncated, page.dropped_rows))
+        Ok((result, has_more, page.truncated, page.dropped_rows))
     }
 
     pub async fn get_indexer_block_height(&self) -> anyhow::Result<Option<u64>> {

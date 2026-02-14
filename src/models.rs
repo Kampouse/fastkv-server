@@ -50,6 +50,20 @@ pub struct KvHistoryRow {
     pub action_index: i32,
 }
 
+// Row from s_kv_by_block table (9 columns, no signer/shard/receipt_index/action_index)
+#[derive(DeserializeRow, Debug, Clone)]
+pub struct KvTimelineRow {
+    pub predecessor_id: String,
+    pub current_account_id: String,
+    pub block_height: i64,
+    pub key: String,
+    pub order_id: i64,
+    pub value: String,
+    pub block_timestamp: i64,
+    pub receipt_id: String,
+    pub tx_hash: String,
+}
+
 // Lightweight row for contract-based account queries (predecessor_id only)
 #[derive(DeserializeRow, Debug, Clone)]
 pub struct ContractAccountRow {
@@ -186,6 +200,23 @@ impl From<KvHistoryRow> for KvEntry {
     }
 }
 
+impl From<KvTimelineRow> for KvEntry {
+    fn from(row: KvTimelineRow) -> Self {
+        let is_deleted = row.value == "null";
+        Self {
+            predecessor_id: row.predecessor_id,
+            current_account_id: row.current_account_id,
+            key: row.key,
+            value: row.value,
+            block_height: bigint_to_u64(row.block_height),
+            block_timestamp: bigint_to_u64(row.block_timestamp),
+            receipt_id: row.receipt_id,
+            tx_hash: row.tx_hash,
+            is_deleted,
+        }
+    }
+}
+
 // Pagination metadata returned in all paginated responses
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct PaginationMeta {
@@ -243,14 +274,46 @@ pub struct GetParams {
     pub value_format: Option<String>,
 }
 
+const VALID_FIELDS: &[&str] = &[
+    "accountId",
+    "contractId",
+    "key",
+    "value",
+    "blockHeight",
+    "blockTimestamp",
+    "receiptId",
+    "txHash",
+    "isDeleted",
+];
+
 /// Parse a comma-separated fields string into a set of field names.
-pub fn parse_field_set(fields: &Option<String>) -> Option<std::collections::HashSet<String>> {
-    fields.as_ref().map(|f| {
-        f.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
+/// Returns 400 if any field name is not in the valid set.
+pub fn parse_field_set(
+    fields: &Option<String>,
+) -> Result<Option<std::collections::HashSet<String>>, ApiError> {
+    match fields.as_ref() {
+        None => Ok(None),
+        Some(f) => {
+            let set: std::collections::HashSet<String> = f
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let invalid: Vec<&str> = set
+                .iter()
+                .filter(|s| !VALID_FIELDS.contains(&s.as_str()))
+                .map(|s| s.as_str())
+                .collect();
+            if !invalid.is_empty() {
+                return Err(ApiError::InvalidParameter(format!(
+                    "fields: unknown field(s): {}. Valid: {}",
+                    invalid.join(", "),
+                    VALID_FIELDS.join(", ")
+                )));
+            }
+            Ok(if set.is_empty() { None } else { Some(set) })
+        }
+    }
 }
 
 /// Convert a dropped-row count to `Option<u32>`, returning `None` for zero.
@@ -351,6 +414,8 @@ pub struct HistoryParams {
     pub key: String,
     #[serde(default = "default_history_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
     #[serde(default = "default_order_desc")]
     pub order: String, // "asc" or "desc"
     #[serde(default)]
@@ -620,14 +685,41 @@ pub struct SocialFollowResponse {
 }
 
 // Error handling
-// Note: serde Serialize is unused — error_response() builds JSON manually via { "error": ... }.
-// The derive is kept for utoipa schema generation only.
+
+/// Machine-readable error codes for API responses.
+#[derive(Debug, Clone, Copy, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    InvalidParameter,
+    DatabaseError,
+    DatabaseUnavailable,
+    TooManyRequests,
+}
+
+/// Structured error response returned by all endpoints on failure.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub code: ErrorCode,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub enum ApiError {
     InvalidParameter(String),
     DatabaseError(String),
     DatabaseUnavailable,
     TooManyRequests(String),
+}
+
+impl ApiError {
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            ApiError::InvalidParameter(_) => ErrorCode::InvalidParameter,
+            ApiError::DatabaseError(_) => ErrorCode::DatabaseError,
+            ApiError::DatabaseUnavailable => ErrorCode::DatabaseUnavailable,
+            ApiError::TooManyRequests(_) => ErrorCode::TooManyRequests,
+        }
+    }
 }
 
 impl fmt::Display for ApiError {
@@ -654,9 +746,10 @@ impl ResponseError for ApiError {
         if matches!(self, ApiError::TooManyRequests(_)) {
             response.insert_header(("Retry-After", "1"));
         }
-        response.json(serde_json::json!({
-            "error": self.to_string()
-        }))
+        response.json(ErrorResponse {
+            error: self.to_string(),
+            code: self.code(),
+        })
     }
 }
 
@@ -724,6 +817,47 @@ pub struct EdgesCountResponse {
     pub edge_type: String,
     pub target: String,
     pub count: usize,
+}
+
+// ===== SSE Watch API types =====
+
+pub const MAX_CONCURRENT_WATCHES: usize = 100;
+pub const MIN_POLL_INTERVAL: u64 = 2;
+pub const MAX_POLL_INTERVAL: u64 = 30;
+pub const SSE_HEARTBEAT_SECS: u64 = 15;
+
+/// Parameters for the SSE key watch endpoint.
+#[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
+pub struct WatchParams {
+    /// NEAR account that wrote the data (signer/predecessor).
+    #[serde(rename = "accountId")]
+    pub predecessor_id: String,
+    /// Contract where the data is stored.
+    #[serde(rename = "contractId")]
+    pub current_account_id: String,
+    /// Key to watch for changes.
+    pub key: String,
+    /// Poll interval in seconds (default 5, clamped to 2–30).
+    #[serde(default = "default_watch_interval")]
+    pub interval: u64,
+}
+
+fn default_watch_interval() -> u64 {
+    5
+}
+
+/// SSE event payload emitted when a watched key changes.
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchEvent {
+    pub key: String,
+    pub value: String,
+    pub block_height: u64,
+    pub block_timestamp: u64,
+    #[serde(rename = "accountId")]
+    pub predecessor_id: String,
+    #[serde(rename = "contractId")]
+    pub current_account_id: String,
 }
 
 #[cfg(test)]
@@ -868,4 +1002,43 @@ mod tests {
         let json = serde_json::to_value(&meta).unwrap();
         assert_eq!(json["dropped_rows"], 3);
     }
+
+    #[test]
+    fn test_parse_field_set_valid() {
+        let input = Some("key,value,blockHeight".to_string());
+        let result = parse_field_set(&input).unwrap().unwrap();
+        assert!(result.contains("key"));
+        assert!(result.contains("value"));
+        assert!(result.contains("blockHeight"));
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_field_set_invalid() {
+        let input = Some("key,bogus".to_string());
+        assert!(parse_field_set(&input).is_err());
+    }
+
+    #[test]
+    fn test_parse_field_set_none() {
+        assert!(parse_field_set(&None).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_field_set_empty_string() {
+        let input = Some("".to_string());
+        assert!(parse_field_set(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let resp = ErrorResponse {
+            error: "test".to_string(),
+            code: ErrorCode::InvalidParameter,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["error"], "test");
+        assert_eq!(json["code"], "INVALID_PARAMETER");
+    }
+
 }

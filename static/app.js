@@ -1277,4 +1277,10 @@ window.addEventListener('hashchange', () => {
 
 currentAccount = accountInput.value.trim();
 breadcrumb = currentAccount ? [currentAccount] : [];
-// readHash() + explore() called from inline script after wallet.js loads
+
+document.getElementById('inspector-toggle').addEventListener('click', toggleInspector);
+document.getElementById('inspector-copy').addEventListener('click', function(e) {
+  e.stopPropagation();
+  copyAsCurl();
+});
+// readHash() + explore() called from wallet.js module after it loads

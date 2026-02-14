@@ -34,14 +34,15 @@
 | `/v1/kv/writers`     | GET    | `writers_handler`     | `kv_reverse`                   | Moderate       | `WHERE current_account_id=? AND key=?` — streams partition (no dedup needed)                                                                                                                 |
 | `/v1/kv/accounts`    | GET    | `accounts_handler`    | `kv_accounts` / `all_accounts` | Cheap/Risky    | Cheap with `key` param (PK+CK). **Risky** without `key` (full partition + 100k dedup). Without `contractId` (`scan=1`): reads `all_accounts` table with TOKEN cursor, throttled 1 req/sec/IP |
 | `/v1/kv/diff`        | GET    | `diff_kv_handler`     | `s_kv`                         | Moderate       | 2 parallel PK+CK lookups at exact block heights                                                                                                                                              |
-| `/v1/kv/timeline`    | GET    | `timeline_kv_handler` | `s_kv`                         | Risky          | `WHERE predecessor_id=? AND current_account_id=?` — full partition, in-memory block filter + sort, 10k row cap                                                                               |
+| `/v1/kv/timeline`    | GET    | `timeline_kv_handler` | `s_kv_by_block`                | Moderate       | `WHERE predecessor_id=? AND current_account_id=? AND block_height >= ? AND block_height <= ?` — CQL pushdown, 10k row cap                                                                   |
 | `/v1/kv/edges`       | GET    | `edges_handler`       | `kv_edges`                     | Moderate/Risky | Moderate with `after_source` cursor (`source > ?`). Risky without cursor (full partition + offset)                                                                                           |
 | `/v1/kv/edges/count` | GET    | `edges_count_handler` | `kv_edges`                     | Expensive      | `SELECT COUNT(*) WHERE edge_type=? AND target=?` — scans entire partition                                                                                                                    |
+| `/v1/kv/watch`       | GET    | `watch_kv_handler`    | `s_kv_last`                    | Cheap (per poll) | SSE stream. Polls `get_kv` every 2–30s. Returns `text/event-stream`. Max 100 concurrent connections.                                                                                       |
 
 **Response headers (all endpoints):**
 
 - `X-Indexer-Block: <height>` — latest indexer block height, cached every 5s from `meta` table, added by middleware
-- `X-Dropped-Rows: <n>` — number of rows skipped due to deserialization errors (only present when > 0; social endpoints only — KV endpoints use `meta.dropped_rows` instead)
+- `Cache-Control: public, max-age=5` — on successful GET `/v1/*` responses (except `/health` and `/v1/status` which use `no-cache`)
 
 ### Social Endpoints
 
@@ -117,6 +118,7 @@ Returns `PaginatedResponse<KvEntry>` or `TreeResponse` (if `format=tree`).
 | `contractId`   | string | yes      |          | Contract account                              |
 | `key`          | string | yes      |          | KV key                                        |
 | `limit`        | int    | no       | 100      | Range 1–1000                                  |
+| `offset`       | int    | no       | 0        | Max 100,000. Applied in-memory after sort.    |
 | `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                           |
 | `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0) |
 | `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0) |
@@ -179,8 +181,8 @@ Returns `DataResponse<DiffResponse>`.
 | `limit`        | int    | no       | 100      | Range 1–1000                                     |
 | `offset`       | int    | no       | 0        | Max 100,000                                      |
 | `order`        | string | no       | `"desc"` | `"asc"` or `"desc"`                              |
-| `from_block`   | int    | no       |          | Min block height (**in-memory filter, not CQL**) |
-| `to_block`     | int    | no       |          | Max block height (**in-memory filter, not CQL**) |
+| `from_block`   | int    | no       |          | Min block height (CQL pushdown, must be >= 0)    |
+| `to_block`     | int    | no       |          | Max block height (CQL pushdown, must be >= 0)    |
 | `fields`       | string | no       |          | Comma-separated field filter                     |
 | `value_format` | string | no       | `"raw"`  | `"raw"` or `"json"` (decoded)                    |
 
@@ -223,6 +225,38 @@ Returns `PaginatedResponse<EdgeSourceEntry>`.
 | `target`    | string | yes      | Target account |
 
 Returns `DataResponse<EdgesCountResponse>`.
+
+### GET /v1/kv/watch (SSE)
+
+Server-Sent Events stream that emits `change` events when a key's value updates.
+
+| Param        | Type   | Required | Default | Notes                                       |
+| ------------ | ------ | -------- | ------- | ------------------------------------------- |
+| `accountId`  | string | yes      |         | NEAR account (signer/predecessor)            |
+| `contractId` | string | yes      |         | Contract where data is stored               |
+| `key`        | string | yes      |         | Key to watch                                |
+| `interval`   | int    | no       | 5       | Poll interval in seconds (clamped to 2–30)  |
+
+Returns `text/event-stream`. Supports `Last-Event-ID` header for reconnection.
+
+**Event types:**
+
+```
+id: 139000500
+event: change
+data: {"key":"profile/name","value":"\"Alice\"","blockHeight":139000500,"blockTimestamp":1707307200000000000,"accountId":"alice.near","contractId":"social.near"}
+
+: heartbeat
+
+event: error
+data: {"error":"poll_failed"}
+```
+
+- `change` — key value updated; `id` is the block height (use as `Last-Event-ID` on reconnect)
+- heartbeat — `:` comment every 15s to keep connection alive
+- `error` — poll failure or database unavailable
+
+**Limits:** Max 100 concurrent watch connections globally. Returns 429 when exceeded.
 
 ### POST /v1/social/get
 
@@ -280,7 +314,7 @@ Returns nested JSON structure. Sets `X-Results-Truncated: true` header if trunca
 
 Returns `{ "entries": [IndexEntry, ...] }`.
 
-Uses a 30-second stream timeout. Aborts after 10 deserialization errors (`MAX_STREAM_ERRORS`). Sets `X-Dropped-Rows: <n>` header when deserialization errors occur.
+Uses a 30-second stream timeout. Aborts after 10 deserialization errors (`MAX_STREAM_ERRORS`). Deserialization errors are reported via `meta.dropped_rows`.
 
 ### GET /v1/social/profile
 
@@ -344,9 +378,20 @@ All paginated endpoints return `PaginatedResponse<T>` with a `meta` object:
 
 **`meta.truncated`** — True only when a scan/dedup cap was hit: 10,000 rows for history/timeline, 100,000 unique values for accounts. Omitted when false (`default: false` in OpenAPI schema). When true, `has_more` may be inaccurate — treat completion as unknown.
 
-**`meta.dropped_rows`** — Number of rows skipped due to deserialization errors. Omitted when zero. Nonzero means the results are complete for the requested page but some rows in the underlying data could not be read. This is a data-quality signal, not a pagination issue — clients do not need to retry. For social endpoints (which lack `meta`), the same information is conveyed via the `X-Dropped-Rows` response header.
+**`meta.dropped_rows`** — Number of rows skipped due to deserialization errors. Omitted when zero. Nonzero means the results are complete for the requested page but some rows in the underlying data could not be read. This is a data-quality signal, not a pagination issue — clients do not need to retry. All paginated endpoints (KV and social) report this in the JSON body.
 
 **Cursor/offset exclusivity** — All endpoints reject `after_*` cursor combined with `offset > 0` (HTTP 400).
+
+**Error responses** — All error responses return a JSON body with a machine-readable code:
+
+```json
+{
+  "error": "Invalid parameter: fields: unknown field(s): bogus",
+  "code": "INVALID_PARAMETER"
+}
+```
+
+Valid codes: `INVALID_PARAMETER` (400), `DATABASE_ERROR` (500), `DATABASE_UNAVAILABLE` (503), `TOO_MANY_REQUESTS` (429).
 
 **Client rule** — Stop paginating when `meta.has_more == false` and `meta.truncated != true`. If `truncated` is true, the client may continue via `next_cursor` but should treat the dataset as potentially incomplete.
 
@@ -429,6 +474,22 @@ interface EdgesCountResponse {
   count: number;
 }
 
+interface WatchEvent {
+  key: string;
+  value: string;
+  blockHeight: number;
+  blockTimestamp: number;
+  accountId: string;
+  contractId: string;
+}
+
+type ErrorCode = "INVALID_PARAMETER" | "DATABASE_ERROR" | "DATABASE_UNAVAILABLE" | "TOO_MANY_REQUESTS";
+
+interface ErrorResponse {
+  error: string;
+  code: ErrorCode;
+}
+
 interface IndexEntry {
   accountId: string;
   blockHeight: number;
@@ -477,6 +538,7 @@ interface HistoryParams {
   contractId: string;
   key: string;
   limit?: number; // default 100, max 1000
+  offset?: number; // default 0, max 100_000
   order?: "asc" | "desc"; // default "desc"
   from_block?: number;
   to_block?: number;
@@ -538,6 +600,13 @@ interface EdgesParams {
 interface EdgesCountParams {
   edge_type: string;
   target: string;
+}
+
+interface WatchParams {
+  accountId: string;
+  contractId: string;
+  key: string;
+  interval?: number; // default 5, clamped to 2–30
 }
 
 interface BatchQuery {
@@ -641,7 +710,13 @@ s_kv_last       PRIMARY KEY ((predecessor_id), current_account_id, key)
 
 s_kv            PRIMARY KEY ((predecessor_id), current_account_id, key, block_height, order_id)
                 → value, block_timestamp, receipt_id, tx_hash, signer_id, shard_id, receipt_index, action_index
-                History table. One row per write event.
+                History table. One row per write event. Used by /kv/history and /kv/diff.
+
+s_kv_by_block   PRIMARY KEY ((predecessor_id, current_account_id), block_height, key)
+                WITH CLUSTERING ORDER BY (block_height DESC, key ASC)
+                → order_id, value, block_timestamp, receipt_id, tx_hash
+                Timeline table. Block-height-first clustering enables CQL range pushdown.
+                Used by /kv/timeline. 9 columns (no signer_id/shard_id/receipt_index/action_index).
 
 mv_kv_cur_key   Materialized view on s_kv_last
                 PRIMARY KEY ((current_account_id, key), predecessor_id)
@@ -701,7 +776,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 | `reverse_list_cursor`      | `kv_reverse`    | PK + `predecessor_id > ?`                            | `/kv/writers` (with cursor)                      |
 | `get_kv_history`           | `s_kv`          | PK + `block_height >= ? AND <= ?`                    | `/kv/history`, `/social/feed/account`            |
 | `get_kv_at_block`          | `s_kv`          | PK + exact block                                     | `/kv/diff`                                       |
-| `get_kv_timeline`          | `s_kv`          | Full partition (2-col PK)                            | `/kv/timeline`                                   |
+| `get_kv_timeline`          | `s_kv_by_block` | PK + `block_height >= ? AND <= ?`                    | `/kv/timeline`                                   |
 | `accounts_by_contract`     | `kv_accounts`   | Full partition (**LocalQuorum**)                     | `/kv/accounts` (no key)                          |
 | `accounts_by_contract_key` | `kv_accounts`   | PK+CK lookup (**LocalQuorum**)                       | `/kv/accounts` (with key)                        |
 | `accounts_all`             | `all_accounts`  | Full table scan (**LocalQuorum**)                    | `/kv/accounts` (scan=1, no cursor)               |
@@ -715,18 +790,12 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 
 ## Open Issues
 
-### Bugs / Missing Features
-
-1. **`/v1/kv/history` has no `offset` parameter.** `HistoryParams` lacks the field entirely. Users must paginate via `from_block`/`to_block` block-range narrowing. This is undocumented and may surprise API consumers.
-
-2. **`/v1/kv/timeline` does not push `from_block`/`to_block` to CQL.** The `get_kv_timeline` prepared statement has no block-height WHERE clause — filtering happens in-memory after a full partition scan. For active accounts, this scans up to 10,000 rows regardless of the block range requested.
-
 ### Performance Risks
 
 | Endpoint                                    | Risk                                            | Trigger                       | Mitigation                                 |
 | ------------------------------------------- | ----------------------------------------------- | ----------------------------- | ------------------------------------------ |
 | `/v1/kv/query`                              | Full partition scan                             | Missing `key_prefix`          | Always provide `key_prefix`                |
-| `/v1/kv/timeline`                           | Full partition + in-memory filter/sort          | Any call                      | Capped at 10,000 rows (`truncated: true`)  |
+| `/v1/kv/timeline`                           | CQL-filtered scan + sort                        | Wide block range or no filter | Capped at 10,000 rows (`truncated: true`)  |
 | `/v1/kv/accounts` (contract)                | Full partition + 100k dedup                     | Missing `key` param           | Always provide `key`                       |
 | `/v1/kv/accounts` (scan)                    | Full table TOKEN scan                           | `scan=1` without `contractId` | Throttled 1 req/sec per IP, max 1000 rows  |
 | `/v1/kv/edges`                              | Full partition + offset                         | Missing `after_source` cursor | Use cursor-based pagination                |
@@ -741,8 +810,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 - **`PaginatedResponse<T>`**: `truncated` field omitted when false (`skip_serializing_if`)
 - **`X-Results-Truncated` header**: Set by `/social/get` and `/social/keys`, exposed via CORS
 - **`X-Indexer-Block` header**: Added to every response by middleware, cached from `meta` table every 5s, exposed via CORS
-- **`meta.dropped_rows`**: Omitted when zero, present as integer when deserialization errors occur on KV endpoints
-- **`X-Dropped-Rows` header**: Set on social endpoints when deserialization errors occur (same semantics, header form)
+- **`meta.dropped_rows`**: Omitted when zero, present as integer when deserialization errors occur (all paginated endpoints)
 - **ORDER BY DESC dedup**: First occurrence kept = newest entry (accounts-by-contract)
 - **`MAX_STREAM_ERRORS = 10`**: Defined in `models.rs:15`, used in `social_handlers.rs:165`
 - **Social handler validation parity**: `validate_offset()` applied to followers/following
@@ -750,3 +818,8 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 - **Error sanitization**: Generic client messages, full context in server logs
 - **DB resilience**: Optional connection with exponential backoff reconnection (5–300s)
 - **Prefix queries prepared at startup**: `prefix_query` and `prefix_cursor_query` are prepared statements (no per-request parsing overhead)
+- **Structured error codes**: All error responses include `code` field (`INVALID_PARAMETER`, `DATABASE_ERROR`, `DATABASE_UNAVAILABLE`, `TOO_MANY_REQUESTS`)
+- **`/v1/kv/history` offset**: Applied in-memory after sort (same pattern as timeline); counts against 10,000-row scan cap
+- **`Cache-Control` headers**: `public, max-age=5` on successful GET `/v1/*` responses; `no-cache` on `/health` and `/v1/status`
+- **SSE `/v1/kv/watch`**: Polls `get_kv` at configurable interval (2–30s); `WatchGuard` RAII decrements counter on disconnect; `Last-Event-ID` reconnection support
+- **Timeline CQL pushdown**: `/v1/kv/timeline` uses `s_kv_by_block` table with `block_height >= ? AND block_height <= ?` in CQL. `KvTimelineRow` (9 columns) deserializes from this table.

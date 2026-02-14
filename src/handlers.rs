@@ -246,8 +246,8 @@ pub async fn health_check(app_state: web::Data<AppState>) -> Result<HttpResponse
     params(GetParams),
     responses(
         (status = 200, description = "Entry found or null if not found", body = inline(DataResponse<Option<KvEntry>>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -274,7 +274,7 @@ pub async fn get_kv_handler(
         .await?;
 
     // Apply field selection and optional value decoding
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     match entry {
         Some(entry) => {
@@ -301,8 +301,8 @@ pub async fn get_kv_handler(
     params(QueryParams),
     responses(
         (status = 200, description = "List of matching entries", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -358,7 +358,7 @@ pub async fn query_kv_handler(
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
@@ -373,8 +373,8 @@ pub async fn query_kv_handler(
     params(HistoryParams),
     responses(
         (status = 200, description = "List of historical entries", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -387,6 +387,7 @@ pub async fn history_kv_handler(
     validate_account_id(&query.current_account_id, "contractId")?;
     validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
     validate_limit(query.limit)?;
+    validate_offset(query.offset)?;
 
     validate_order(&query.order)?;
     validate_block_range(query.from_block, query.to_block)?;
@@ -397,6 +398,7 @@ pub async fn history_kv_handler(
         contractId = %query.current_account_id,
         key = %query.key,
         limit = query.limit,
+        offset = query.offset,
         order = %query.order,
         from_block = ?query.from_block,
         to_block = ?query.to_block,
@@ -413,7 +415,7 @@ pub async fn history_kv_handler(
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
@@ -425,8 +427,8 @@ pub async fn history_kv_handler(
     params(WritersParams),
     responses(
         (status = 200, description = "List of entries from writers", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -470,7 +472,7 @@ pub async fn writers_handler(
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
@@ -490,9 +492,9 @@ pub async fn writers_handler(
     params(AccountsQueryParams),
     responses(
         (status = 200, description = "List of writer accounts", body = inline(PaginatedResponse<String>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 429, description = "Too many scan requests", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 429, description = "Too many scan requests", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -598,9 +600,9 @@ pub async fn accounts_handler(
     params(ContractsQueryParams),
     responses(
         (status = 200, description = "List of contract IDs", body = inline(PaginatedResponse<String>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 429, description = "Too many requests", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 429, description = "Too many requests", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -668,8 +670,8 @@ pub async fn contracts_handler(
     params(DiffParams),
     responses(
         (status = 200, description = "Values at both block heights", body = inline(DataResponse<DiffResponse>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -714,7 +716,7 @@ pub async fn diff_kv_handler(
     )
     .await?;
 
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     if fields.is_some() || decode {
         let mut a_json = a.as_ref().map(|e| e.to_json_with_fields(&fields));
@@ -745,8 +747,8 @@ pub async fn diff_kv_handler(
     params(TimelineParams),
     responses(
         (status = 200, description = "Chronological list of all writes", body = inline(PaginatedResponse<KvEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -785,7 +787,7 @@ pub async fn timeline_kv_handler(
         next_cursor,
         dropped_rows: dropped_to_option(dropped),
     };
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
@@ -797,8 +799,8 @@ pub async fn timeline_kv_handler(
     request_body = BatchQuery,
     responses(
         (status = 200, description = "Batch results", body = inline(DataResponse<Vec<BatchResultItem>>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -893,8 +895,8 @@ pub async fn batch_kv_handler(
     params(EdgesParams),
     responses(
         (status = 200, description = "List of edge sources", body = inline(PaginatedResponse<EdgeSourceEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -956,8 +958,8 @@ pub async fn edges_handler(
     params(EdgesCountParams),
     responses(
         (status = 200, description = "Edge count", body = inline(DataResponse<EdgesCountResponse>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "kv"
 )]
@@ -986,6 +988,134 @@ pub async fn edges_count_handler(
             count,
         },
     }))
+}
+
+/// Watch a key for changes via Server-Sent Events (SSE).
+///
+/// Returns a `text/event-stream` that emits `change` events whenever the
+/// watched key's block height advances.  Supports `Last-Event-ID` for
+/// reconnection.  Server limits concurrent watches to `MAX_CONCURRENT_WATCHES`.
+#[utoipa::path(
+    get,
+    path = "/v1/kv/watch",
+    params(WatchParams),
+    responses(
+        (status = 200, description = "SSE event stream", content_type = "text/event-stream"),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 429, description = "Too many watch connections", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
+    ),
+    tag = "kv"
+)]
+#[get("/v1/kv/watch")]
+pub async fn watch_kv_handler(
+    query: web::Query<WatchParams>,
+    app_state: web::Data<AppState>,
+    req: HttpRequest,
+) -> Result<HttpResponse, ApiError> {
+    validate_account_id(&query.predecessor_id, "accountId")?;
+    validate_account_id(&query.current_account_id, "contractId")?;
+    validate_key(&query.key, "key", MAX_KEY_LENGTH)?;
+
+    let poll_secs = query.interval.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
+
+    // Check concurrent watch limit
+    let current = app_state
+        .watch_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if current >= MAX_CONCURRENT_WATCHES {
+        return Err(ApiError::TooManyRequests(
+            "Too many active watch connections".to_string(),
+        ));
+    }
+
+    // Verify DB is available
+    let _ = require_db(&app_state).await?;
+
+    tracing::info!(
+        target: PROJECT_ID,
+        accountId = %query.predecessor_id,
+        contractId = %query.current_account_id,
+        key = %query.key,
+        interval = poll_secs,
+        "GET /v1/kv/watch (SSE)"
+    );
+
+    // Support Last-Event-ID for reconnection
+    let last_block: Option<u64> = req
+        .headers()
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let scylladb = app_state.scylladb.clone();
+    let watch_count = app_state.watch_count.clone();
+    let predecessor_id = query.predecessor_id.clone();
+    let current_account_id = query.current_account_id.clone();
+    let key = query.key.clone();
+
+    watch_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let stream = async_stream::stream! {
+        let mut last_known_block = last_block.unwrap_or(0);
+        let mut poll_interval = tokio::time::interval(Duration::from_secs(poll_secs));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(SSE_HEARTBEAT_SECS));
+        let _guard = WatchGuard(watch_count.clone());
+
+        loop {
+            tokio::select! {
+                _ = poll_interval.tick() => {
+                    let guard = scylladb.read().await;
+                    if let Some(db) = guard.as_ref() {
+                        match db.get_kv(&predecessor_id, &current_account_id, &key).await {
+                            Ok(Some(entry)) if entry.block_height > last_known_block => {
+                                last_known_block = entry.block_height;
+                                let event = WatchEvent {
+                                    key: entry.key,
+                                    value: entry.value,
+                                    block_height: entry.block_height,
+                                    block_timestamp: entry.block_timestamp,
+                                    predecessor_id: entry.predecessor_id.clone(),
+                                    current_account_id: entry.current_account_id.clone(),
+                                };
+                                if let Ok(data) = serde_json::to_string(&event) {
+                                    let msg = format!("id: {}\nevent: change\ndata: {}\n\n", last_known_block, data);
+                                    yield Ok::<actix_web::web::Bytes, actix_web::Error>(actix_web::web::Bytes::from(msg));
+                                }
+                            }
+                            Ok(_) => {} // No change
+                            Err(e) => {
+                                tracing::warn!(target: PROJECT_ID, error = %e, "Watch poll error");
+                                let msg = "event: error\ndata: {\"error\":\"poll_failed\"}\n\n";
+                                yield Ok(actix_web::web::Bytes::from(msg));
+                            }
+                        }
+                    } else {
+                        let msg = "event: error\ndata: {\"error\":\"database_unavailable\"}\n\n";
+                        yield Ok(actix_web::web::Bytes::from(msg));
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    yield Ok(actix_web::web::Bytes::from(": heartbeat\n\n"));
+                }
+            }
+        }
+    };
+
+    Ok(HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("Connection", "keep-alive"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream))
+}
+
+/// RAII guard that decrements the watch counter when the SSE stream drops.
+struct WatchGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Indexer status: block height and server time

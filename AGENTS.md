@@ -88,7 +88,7 @@ pub async fn my_handler(
 
     let next_cursor = entries.last().map(|e| e.key.clone());
     let meta = PaginationMeta { has_more, truncated: false, next_cursor, dropped_rows: dropped_to_option(dropped) };
-    let fields = parse_field_set(&query.fields);
+    let fields = parse_field_set(&query.fields)?;
     let decode = should_decode(&query.value_format)?;
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
@@ -104,7 +104,7 @@ These are load-bearing. Breaking any one breaks client pagination.
 4. **`has_more` truthfulness.** Authoritative for cursor+limit endpoints. Best-effort when `truncated == true`. If `truncated` is true, treat `has_more` as unreliable; use `next_cursor` to resume.
 5. **Cursor/offset mutual exclusion.** Both `after_*` and `offset > 0` → reject with HTTP 400.
 6. **No pagination fields outside `meta`.** Never add `has_more`, `next_cursor`, or `truncated` to the top level.
-7. **`dropped_rows` from deser errors.** `meta.dropped_rows` reports rows skipped due to deserialization failures. Omitted when zero (`Option<u32>`, `skip_serializing_if`). For social endpoints, use `X-Dropped-Rows` header instead (no `meta` envelope). Never expose error details — just the count.
+7. **`dropped_rows` from deser errors.** `meta.dropped_rows` reports rows skipped due to deserialization failures. Omitted when zero (`Option<u32>`, `skip_serializing_if`). All paginated endpoints (KV and social) use `meta.dropped_rows` in the JSON body. Never expose error details — just the count.
 
 **Client stop rule:**
 Stop paginating when `meta.has_more == false && meta.truncated != true`.
@@ -128,7 +128,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 2. **Never interpolate user input into CQL.** Table names are interpolated but validated at startup via `validate_identifier()`. User values go through bind parameters (`?`) only.
 3. **Do not panic on DB disconnect.** `require_db()` returns `Err(DatabaseUnavailable)`. Never `.unwrap()` on DB access.
 4. **Do not add `deny_unknown_fields`** to request structs — breaks forward compatibility.
-5. **Error sanitization.** `From<anyhow::Error> for ApiError` logs full context, returns generic message. Never expose table names, IPs, or schema in client-facing errors.
+5. **Error sanitization.** `From<anyhow::Error> for ApiError` logs full context, returns generic message. Never expose table names, IPs, or schema in client-facing errors. All error responses include a machine-readable `code` field (`ErrorCode` enum) alongside the human-readable `error` string — see `ErrorResponse` in models.rs.
 6. **New configurable table names must call `validate_identifier()`** in `ScyllaDb::new()`.
 7. **DB is `Arc<RwLock<Option<ScyllaDb>>>`** — server starts and runs without a DB connection. All handlers must call `require_db()` and return `DatabaseUnavailable` if `None`. Never hold the `RwLock` guard across `.await` — this deadlocks the server.
 
@@ -142,11 +142,12 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 ## Hot Endpoints (Do Not Remove Safeguards)
 
 - `/v1/kv/query` without `key_prefix` — full partition scan. **Prefer `key_prefix` to narrow.**
-- `/v1/kv/timeline` — full partition scan + in-memory filter/sort, capped at 10k rows. **Narrow with `from_block`/`to_block`.**
+- `/v1/kv/timeline` — reads `s_kv_by_block` with CQL block-height pushdown, capped at 10k rows. **Use `from_block`/`to_block` to narrow (CQL-filtered, not in-memory).**
 - `/v1/kv/accounts` without `key` — full partition scan + HashSet dedup, capped at 100k unique. **Prefer `key` filter.**
 - `/v1/kv/accounts` without `contractId` (`scan=1`) — reads `all_accounts` table (no dedup needed, TOKEN-based cursor). Throttled 1 req/sec/IP, limit clamped to 1,000. **Admin/dev only.**
 - `/v1/kv/writers` — streams entire reverse table partition (unbounded, no scan cap). **Use cursor pagination with tight `limit`.**
 - `/v1/kv/edges/count` — `COUNT(*)` scans entire partition. **No mitigation; avoid in hot loops.**
+- `/v1/kv/watch` — SSE endpoint; polls `get_kv` per interval (2–30s). **Capped at 100 concurrent connections globally.** Uses `WatchGuard` RAII for cleanup.
 
 ## Hard Limits (Do Not Change Casually)
 
@@ -158,6 +159,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 | `MAX_OFFSET`         | 100,000 | Hard ceiling on offset pagination.                                                      |
 | `MAX_BATCH_KEYS`     | 100     | Concurrent batch lookups (buffered 10 at a time).                                       |
 | `MAX_SCAN_LIMIT`     | 1,000   | Max `limit` for `/v1/kv/accounts` without `contractId` (`scan=1`).                      |
+| `MAX_CONCURRENT_WATCHES` | 100 | Global cap on SSE `/v1/kv/watch` connections. Memory + DB polling bound.                |
 
 Full constant list in models.rs:1–20.
 
@@ -173,8 +175,7 @@ Full constant list in models.rs:1–20.
 
 - **Do not add new pagination styles.** One style: `PaginationMeta` with `has_more`/`truncated`/`next_cursor`/`dropped_rows`.
 - **Do not re-add `decode` param.** It was removed. Use `value_format=json|raw` only.
-- **Do not push block filters into CQL for `/kv/timeline`.** The partition layout (`predecessor_id, current_account_id`) doesn't support it. In-memory filtering is intentional.
-- **Do not add `offset` to `/kv/history`.** Pagination is via `from_block`/`to_block` narrowing. Adding offset would need scan cap interaction redesign.
+- **`/kv/timeline` uses `s_kv_by_block` table with CQL block-height pushdown.** `KvTimelineRow` (9 columns) maps to this table; do not confuse with `KvHistoryRow` (13 columns) used by `/kv/history`.
 - **Do not make `build_tree()` error on conflicts.** Leaf at "a/b" blocks nesting "a/b/c" — it skips silently. This is intentional.
 - **Do not remove scan caps** from history/timeline/accounts. They prevent unbounded partition scans in prod.
 - **Do not mix `rename` and `alias` conventions.** KV params use `#[serde(rename = "accountId")]` (one canonical form). Social params use `#[serde(alias = "accountId")]` (accept both for SocialDB compat).
@@ -186,4 +187,5 @@ Full constant list in models.rs:1–20.
 - **models.rs:1–18** — All constants
 - **scylladb.rs `collect_page()`** — Reusable paginated stream helper (overfetch + scan-cap modes). 8 unit tests.
 - **scylladb.rs:131–393** — ScyllaDb struct + all prepared statement initialization
-- **main.rs** — `X-Indexer-Block` header middleware (cached `AtomicU64`, refreshed 5s); don't remove
+- **main.rs** — `X-Indexer-Block` + `Cache-Control` header middleware (cached `AtomicU64`, refreshed 5s); don't remove
+- **models.rs `ErrorCode`** — Machine-readable codes in all error responses. Keep enum in sync with `ApiError` variants.

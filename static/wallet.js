@@ -294,7 +294,7 @@ function viewWrittenData(accountId, keyPath) {
   if (typeof explore === 'function') explore(`${keyPath}/**`);
 }
 
-// ── Expose API for app.js and inline handlers ───────────────
+// ── Expose API for app.js ────────────────────────────────────
 
 window.walletIsSignedIn = walletIsSignedIn;
 window.walletGetAccountId = walletGetAccountId;
@@ -310,3 +310,16 @@ Object.defineProperty(window, 'writeBatchMode', {
   get() { return writeBatchMode; },
   set(v) { writeBatchMode = v; },
 });
+
+// ── Wire up DOM event listeners ──────────────────────────────
+
+document.getElementById('connect-wallet-btn').addEventListener('click', walletSignIn);
+document.getElementById('write-mode-toggle').addEventListener('click', toggleBatchMode);
+document.getElementById('write-key').addEventListener('input', updateWritePreview);
+document.getElementById('write-batch-input').addEventListener('input', updateWritePreview);
+document.getElementById('write-btn').addEventListener('click', writeData);
+
+// ── Init (replaces inline <script type="module"> block) ──────
+
+if (!readHash()) explore();
+initNear().catch((e) => console.warn('Wallet init failed:', e));

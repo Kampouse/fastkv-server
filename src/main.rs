@@ -6,9 +6,8 @@ mod tree;
 
 use crate::handlers::{
     accounts_handler, batch_kv_handler, contracts_handler, diff_kv_handler, edges_count_handler,
-    edges_handler,
-    get_kv_handler, health_check, history_kv_handler, query_kv_handler, status_handler,
-    timeline_kv_handler, writers_handler,
+    edges_handler, get_kv_handler, health_check, history_kv_handler, query_kv_handler,
+    status_handler, timeline_kv_handler, watch_kv_handler, writers_handler,
 };
 use crate::scylladb::ScyllaDb;
 use crate::social_handlers::{
@@ -46,6 +45,7 @@ use crate::models::PROJECT_ID;
         handlers::contracts_handler,
         handlers::edges_handler,
         handlers::edges_count_handler,
+        handlers::watch_kv_handler,
         social_handlers::social_get_handler,
         social_handlers::social_keys_handler,
         social_handlers::social_index_handler,
@@ -63,6 +63,8 @@ use crate::models::PROJECT_ID;
         models::HistoryParams,
         models::WritersParams,
         models::ApiError,
+        models::ErrorCode,
+        models::ErrorResponse,
         models::BatchQuery,
         models::BatchResultItem,
         models::TreeResponse,
@@ -86,6 +88,8 @@ use crate::models::PROJECT_ID;
         models::IndexEntry,
         models::SocialFollowResponse,
         models::PaginationMeta,
+        models::WatchParams,
+        models::WatchEvent,
     )),
     info(
         title = "FastKV API",
@@ -106,6 +110,8 @@ pub struct AppState {
     pub chain_id: ChainId,
     /// Per-IP throttle for scan=1 requests on /v1/kv/accounts.
     pub scan_throttle: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Active SSE watch connection count.
+    pub watch_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[actix_web::main]
@@ -219,15 +225,10 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec!["GET", "POST"])
-            .allowed_headers(vec![
-                header::CONTENT_TYPE,
-                header::AUTHORIZATION,
-                header::ACCEPT,
-            ])
+            .allowed_headers(vec![header::CONTENT_TYPE, header::ACCEPT])
             .expose_headers(vec![
                 "X-Results-Truncated",
                 "X-Indexer-Block",
-                "X-Dropped-Rows",
             ])
             .max_age(3600);
 
@@ -237,12 +238,15 @@ async fn main() -> std::io::Result<()> {
                 scylladb: Arc::clone(&scylladb),
                 chain_id,
                 scan_throttle: scan_throttle.clone(),
+                watch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }))
             .wrap(cors)
             .wrap_fn({
                 let cache = block_cache;
                 move |req, srv| {
                     let h = cache.load(Ordering::Relaxed);
+                    let path = req.path().to_string();
+                    let method = req.method().clone();
                     let fut = srv.call(req);
                     async move {
                         let mut res = fut.await?;
@@ -251,6 +255,22 @@ async fn main() -> std::io::Result<()> {
                                 header::HeaderName::from_static("x-indexer-block"),
                                 header::HeaderValue::from(h),
                             );
+                        }
+                        // Cache-Control for successful GET API responses
+                        if method == actix_web::http::Method::GET && res.status().is_success() {
+                            let cc = if path == "/health" || path == "/v1/status" {
+                                "no-cache"
+                            } else if path.starts_with("/v1/") {
+                                "public, max-age=5"
+                            } else {
+                                ""
+                            };
+                            if !cc.is_empty() {
+                                res.headers_mut().insert(
+                                    header::CACHE_CONTROL,
+                                    header::HeaderValue::from_static(cc),
+                                );
+                            }
                         }
                         Ok(res)
                     }
@@ -275,6 +295,7 @@ async fn main() -> std::io::Result<()> {
             .service(contracts_handler)
             .service(edges_handler)
             .service(edges_count_handler)
+            .service(watch_kv_handler)
             .service(social_get_handler)
             .service(social_keys_handler)
             .service(social_index_handler)

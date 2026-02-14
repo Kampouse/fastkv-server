@@ -110,6 +110,11 @@ fn parse_social_key(pattern: &str) -> Result<KeyPattern, ApiError> {
         });
     }
 
+    if account_part.is_empty() {
+        return Err(ApiError::InvalidParameter(
+            "keys[]: account ID cannot be empty".to_string(),
+        ));
+    }
     if account_part.len() > MAX_ACCOUNT_ID_LENGTH {
         return Err(ApiError::InvalidParameter(
             "keys[]: account ID exceeds max length".to_string(),
@@ -275,8 +280,8 @@ async fn query_index(q: IndexQuery<'_>) -> Result<(Vec<IndexEntry>, usize, bool)
     request_body = SocialGetBody,
     responses(
         (status = 200, description = "Nested JSON matching SocialDB get() format"),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -453,8 +458,8 @@ pub async fn social_get_handler(
     request_body = SocialKeysBody,
     responses(
         (status = 200, description = "Nested JSON with key structure"),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -687,8 +692,8 @@ pub async fn social_keys_handler(
     params(SocialIndexParams),
     responses(
         (status = 200, description = "Index entries", body = inline(PaginatedResponse<IndexEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -761,8 +766,8 @@ pub async fn social_index_handler(
     params(SocialProfileParams),
     responses(
         (status = 200, description = "Profile JSON"),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -803,8 +808,8 @@ pub async fn social_profile_handler(
     params(SocialFollowParams),
     responses(
         (status = 200, description = "Follower accounts", body = SocialFollowResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -862,8 +867,8 @@ pub async fn social_followers_handler(
     params(SocialFollowParams),
     responses(
         (status = 200, description = "Following accounts", body = SocialFollowResponse),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -931,8 +936,8 @@ pub async fn social_following_handler(
     params(SocialAccountFeedParams),
     responses(
         (status = 200, description = "Account feed", body = inline(PaginatedResponse<IndexEntry>)),
-        (status = 400, description = "Invalid parameters", body = ApiError),
-        (status = 503, description = "Database unavailable", body = ApiError),
+        (status = 400, description = "Invalid parameters", body = ErrorResponse),
+        (status = 503, description = "Database unavailable", body = ErrorResponse),
     ),
     tag = "social"
 )]
@@ -982,6 +987,7 @@ pub async fn social_account_feed_handler(
         current_account_id: contract.to_string(),
         key: "post/main".to_string(),
         limit: fetch_limit,
+        offset: 0,
         order: query.order.clone(),
         from_block,
         to_block,
@@ -994,6 +1000,7 @@ pub async fn social_account_feed_handler(
         current_account_id: contract.to_string(),
         key: "post/comment".to_string(),
         limit: fetch_limit,
+        offset: 0,
         order: query.order.clone(),
         from_block,
         to_block,
@@ -1001,16 +1008,16 @@ pub async fn social_account_feed_handler(
         value_format: None,
     };
 
-    let all_posts: Vec<IndexEntry> = if include_replies {
+    let (all_posts, total_dropped): (Vec<IndexEntry>, usize) = if include_replies {
         let ((entries, _hm1, _tr1, dropped1), (comment_entries, _hm2, _tr2, dropped2)) =
             futures::future::try_join(
                 scylladb.get_kv_history(&history_params),
                 scylladb.get_kv_history(&comment_params),
             )
             .await?;
-        let total_dropped = dropped1 + dropped2;
-        if total_dropped > 0 {
-            tracing::warn!(target: PROJECT_ID, dropped = total_dropped, "Dropped rows in social feed");
+        let dropped = dropped1 + dropped2;
+        if dropped > 0 {
+            tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social feed");
         }
 
         let mut combined: Vec<IndexEntry> = entries
@@ -1026,14 +1033,14 @@ pub async fn social_account_feed_handler(
         }
 
         combined.truncate(fetch_limit);
-        combined
+        (combined, dropped)
     } else {
         let (entries, _has_more, _truncated, dropped) =
             scylladb.get_kv_history(&history_params).await?;
         if dropped > 0 {
             tracing::warn!(target: PROJECT_ID, dropped, "Dropped rows in social feed");
         }
-        entries.into_iter().map(to_index_entry).collect()
+        (entries.into_iter().map(to_index_entry).collect(), dropped)
     };
 
     let has_more = all_posts.len() > query.limit;
@@ -1044,7 +1051,7 @@ pub async fn social_account_feed_handler(
         has_more,
         truncated: false,
         next_cursor,
-        dropped_rows: None,
+        dropped_rows: dropped_to_option(total_dropped),
     };
 
     Ok(HttpResponse::Ok().json(PaginatedResponse {
@@ -1204,6 +1211,11 @@ mod tests {
     #[test]
     fn test_parse_wildcard_account_with_wildcard_key_rejected() {
         assert!(parse_social_key("*/profile/**").is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_account_rejected() {
+        assert!(parse_social_key("/post/main").is_err());
     }
 
     #[test]
