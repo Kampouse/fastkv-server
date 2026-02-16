@@ -59,7 +59,7 @@ function buildHash() {
   const p = new URLSearchParams();
   if (viewMode === "write") {
     p.set("view", "write");
-    p.set("contract", contractId);
+    if (contractId) p.set("contract", contractId);
     const keyEl = document.getElementById("write-key");
     if (keyEl && keyEl.value) p.set("key", keyEl.value);
     const valEl = document.getElementById("write-value");
@@ -1130,6 +1130,20 @@ function render() {
 }
 
 // ── Event listeners ─────────────────────────────────────────
+
+document.getElementById("home-link")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  contractId = "";
+  contractInput.value = "";
+  currentAccount = "";
+  accountInput.value = "";
+  queryInput.value = "";
+  breadcrumb = [];
+  multiAccountMode = true;
+  groupBy = "account";
+  setViewMode("tree");
+  explore();
+});
 
 exploreForm.onsubmit = (e) => {
   e.preventDefault();
