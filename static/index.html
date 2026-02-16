@@ -2,8 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' https://esm.sh 'sha256-YHJHDJng+iozuy8fDZVnJ6tD36uK68vfZ1ZAfNU6Yn4='; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; img-src 'self' data:" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' https://esm.sh 'sha256-BfJOqmrvGW4xa9ZrsiUKYORjzdS0mPSQl0EKyU6psR4='; style-src 'self' 'unsafe-inline'; connect-src 'self' https:; img-src 'self' data:"
+    />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>NEAR Garden</title>
     <meta
@@ -30,12 +32,12 @@
     />
     <link rel="stylesheet" href="/style.css" />
     <script type="importmap">
-    {
-      "imports": {
-        "near-kit": "https://esm.sh/near-kit@0.11.0",
-        "@hot-labs/near-connect": "https://esm.sh/@hot-labs/near-connect@0.9.0"
+      {
+        "imports": {
+          "near-kit": "https://esm.sh/near-kit@0.11.0",
+          "@hot-labs/near-connect": "https://esm.sh/@hot-labs/near-connect@0.9.0"
+        }
       }
-    }
     </script>
   </head>
   <body>
@@ -73,7 +75,14 @@
               spellcheck="false"
             />
           </div>
-          <button type="button" id="swap-btn" class="swap-btn" title="Swap grouping order">&#8645;</button>
+          <button
+            type="button"
+            id="swap-btn"
+            class="swap-btn"
+            title="Swap grouping order"
+          >
+            &#8645;
+          </button>
           <div class="contract-row" id="row-account">
             <label for="account-input" class="label">account</label>
             <input
@@ -91,21 +100,11 @@
             placeholder="key"
             spellcheck="false"
           />
-          <button type="submit" id="explore-btn">explore_</button>
+          <button type="submit" id="explore-btn">explore</button>
         </form>
       </div>
 
       <div id="breadcrumb" class="breadcrumb"></div>
-
-      <div class="view-toggle">
-        <button type="button" id="view-tree" class="active" aria-pressed="true">
-          tree
-        </button>
-        <button type="button" id="view-json" aria-pressed="false">json</button>
-        <button type="button" id="view-write" aria-pressed="false" hidden>
-          write
-        </button>
-      </div>
 
       <div id="error-bar" class="error-bar" hidden aria-live="polite">
         <span id="error-msg"></span>
@@ -121,23 +120,6 @@
           <pre id="detail-value" class="detail-value"></pre>
           <div id="detail-meta" class="detail-meta"></div>
         </div>
-        <div id="history-panel" class="panel history-panel" hidden>
-          <div class="history-title">history</div>
-          <div id="history-list" class="history-list"></div>
-          <div class="history-copy-bar copy-bar"></div>
-          <div class="diff-controls">
-            <select id="diff-select-a" class="diff-select"></select>
-            <span class="diff-vs">vs</span>
-            <select id="diff-select-b" class="diff-select"></select>
-            <button type="button" id="diff-btn">diff</button>
-          </div>
-          <pre id="diff-result" class="diff-result"></pre>
-          <div id="diff-copy-bar" class="copy-bar"></div>
-        </div>
-      </div>
-
-      <div id="json-panel" class="panel json-panel" hidden>
-        <pre id="json-view"></pre>
       </div>
 
       <!-- Write panel -->
@@ -169,42 +151,8 @@
           </div>
         </div>
 
-        <button
-          type="button"
-          id="write-btn"
-          class="write-btn"
-        >
-          save
-        </button>
+        <button type="button" id="write-btn" class="write-btn">save</button>
         <div id="write-status" class="write-status" aria-live="polite"></div>
-      </div>
-
-      <!-- Feed panel (timeline) -->
-      <div id="feed-panel" class="panel feed-panel" hidden>
-        <div id="feed-list" class="feed-list"></div>
-      </div>
-
-      <!-- API Inspector -->
-      <div id="api-inspector" class="api-inspector" hidden>
-        <div
-          class="inspector-toggle"
-          id="inspector-toggle"
-          role="button"
-          tabindex="0"
-        >
-          <span class="inspector-arrow" id="inspector-arrow">&#9656;</span>
-          <span id="inspector-summary">API Call</span>
-          <button
-            type="button"
-            class="inspector-copy"
-            id="inspector-copy"
-          >
-            copy curl
-          </button>
-        </div>
-        <div id="inspector-detail" class="inspector-detail" hidden>
-          <pre id="inspector-body"></pre>
-        </div>
       </div>
     </main>
 

@@ -107,9 +107,17 @@ function renderWalletUI() {
     if (acctInput && acctInput.value === 'root.near') {
       acctInput.value = accountId;
     }
-    // Enable the write tab
-    const writeBtn = document.getElementById('view-write');
-    if (writeBtn) { writeBtn.hidden = false; writeBtn.disabled = false; }
+    // Add "create" button to header
+    const createBtn = document.createElement('button');
+    createBtn.type = 'button';
+    createBtn.className = 'wallet-btn create-btn';
+    createBtn.textContent = 'create';
+    createBtn.onclick = () => {
+      if (typeof setViewMode === 'function') {
+        setViewMode(typeof viewMode !== 'undefined' && viewMode === 'write' ? 'tree' : 'write');
+      }
+    };
+    container.prepend(createBtn);
     // Hide connect prompt, show write form
     const connectPrompt = document.getElementById('write-connect-prompt');
     if (connectPrompt) connectPrompt.hidden = true;
@@ -121,9 +129,6 @@ function renderWalletUI() {
     btn.textContent = 'connect wallet';
     btn.onclick = walletSignIn;
     container.append(btn);
-    // Disable the write tab
-    const writeBtn = document.getElementById('view-write');
-    if (writeBtn) { writeBtn.hidden = true; writeBtn.disabled = true; }
     // Show connect prompt, hide write form
     const connectPrompt = document.getElementById('write-connect-prompt');
     if (connectPrompt) connectPrompt.hidden = false;
@@ -248,5 +253,4 @@ document.getElementById('write-btn')?.addEventListener('click', writeData);
 
 // ── Init (replaces inline <script type="module"> block) ──────
 
-if (!readHash()) explore();
 initNear().catch((e) => console.warn('Wallet init failed:', e));
