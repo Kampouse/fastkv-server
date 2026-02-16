@@ -32,7 +32,7 @@
 | `/v1/kv/query`       | GET    | `query_kv_handler`    | `s_kv_last`                    | Moderate       | `WHERE ... AND key >= ? AND key < ?` (prefix). **Risky** without `key_prefix` (full partition)                                                                                               |
 | `/v1/kv/history`     | GET    | `history_kv_handler`  | `s_kv`                         | Cheap          | `WHERE ... AND key=? AND block_height >= ? AND block_height <= ? ORDER BY block_height {ASC\|DESC}` — cursor-based overfetch pagination                                                      |
 | `/v1/kv/writers`     | GET    | `writers_handler`     | `kv_reverse`                   | Moderate       | `WHERE current_account_id=? AND key=?` — streams partition (no dedup needed)                                                                                                                 |
-| `/v1/kv/accounts`    | GET    | `accounts_handler`    | `kv_accounts` / `all_accounts` | Cheap/Risky    | Cheap with `key` param (PK+CK). **Risky** without `key` (full partition + 100k dedup). Without `contractId` (`scan=1`): reads `all_accounts` table with TOKEN cursor, throttled 1 req/sec/IP |
+| `/v1/kv/accounts`    | GET    | `accounts_handler`    | `kv_accounts` / `all_accounts` | Cheap/Risky    | Cheap with `key` param (PK+CK). **Risky** without `key` (full partition + 100k dedup). Without `contractId`: reads `all_accounts` table with TOKEN cursor, throttled 1 req/sec/IP |
 | `/v1/kv/diff`        | GET    | `diff_kv_handler`     | `s_kv`                         | Moderate       | 2 parallel PK+CK lookups at exact block heights                                                                                                                                              |
 | `/v1/kv/timeline`    | GET    | `timeline_kv_handler` | `s_kv_by_block`                | Moderate       | `WHERE predecessor_id=? AND current_account_id=? AND block_height >= ? AND block_height <= ? ORDER BY block_height {ASC\|DESC}` — cursor-based overfetch pagination                          |
 | `/v1/kv/edges`       | GET    | `edges_handler`       | `kv_edges`                     | Moderate/Risky | Moderate with `after_source` cursor (`source > ?`). Risky without cursor (full partition + offset)                                                                                           |
@@ -195,8 +195,7 @@ Returns `PaginatedResponse<KvEntry>`. Uses CQL `ORDER BY` with cursor-based over
 
 | Param           | Type   | Required | Default | Notes                                                                                                                   |
 | --------------- | ------ | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `contractId`    | string | no       |         | Contract account, max 256 chars. When omitted, requires `scan=1`.                                                       |
-| `scan`          | int    | no       |         | Set to `1` to opt-in to full table scan when `contractId` is omitted.                                                   |
+| `contractId`    | string | no       |         | Contract account, max 256 chars. When omitted, performs a full table scan (throttled).                                   |
 | `key`           | string | no       |         | Key filter. **Recommended for large contracts** — omitting triggers full partition scan + dedup. Requires `contractId`. |
 | `limit`         | int    | no       | 100     | Range 1–1000. Clamped to 1,000 max when `contractId` is omitted.                                                        |
 | `offset`        | int    | no       | 0       | Max 100,000. Not available when `contractId` is omitted.                                                                |
@@ -204,7 +203,7 @@ Returns `PaginatedResponse<KvEntry>`. Uses CQL `ORDER BY` with cursor-based over
 
 Returns `PaginatedResponse<String>` (list of account IDs). `meta.truncated: true` if dedup scan hit 100,000.
 
-> **Scan mode** (`contractId` omitted, `scan=1`): queries the dedicated `all_accounts` table (one row per unique account). Pagination is **token-ordered** (Murmur3 hash order), not alphabetical — results appear in a stable but non-lexicographic order. Pass the last returned account ID as `after_account` to resume. Throttled to 1 req/sec per IP (429 if exceeded). Intended for admin/dev use.
+> **Scan mode** (`contractId` omitted): queries the dedicated `all_accounts` table (one row per unique account). Pagination is **token-ordered** (Murmur3 hash order), not alphabetical — results appear in a stable but non-lexicographic order. Pass the last returned account ID as `after_account` to resume. Rate-limited to 1 req/sec per IP as a courtesy limit to prevent accidental repeated scans (429 if exceeded).
 >
 > **Required table:** `all_accounts` (`predecessor_id text PRIMARY KEY`). Override name via `ALL_ACCOUNTS_TABLE_NAME` env var.
 
@@ -559,8 +558,7 @@ interface WritersParams {
 }
 
 interface AccountsQueryParams {
-  contractId?: string; // optional; requires scan=1 when omitted
-  scan?: number; // 1 to opt-in to full table scan when contractId omitted
+  contractId?: string; // optional; full table scan when omitted (throttled)
   key?: string; // requires contractId
   limit?: number; // clamped to 1,000 when contractId omitted
   offset?: number; // not available when contractId omitted
@@ -689,7 +687,7 @@ interface SocialAccountFeedParams {
 | `HISTORY_TABLE_NAME`         | `s_kv`                | History table (with block_height clustering)                                 |
 | `REVERSE_VIEW_NAME`          | `mv_kv_cur_key`       | Materialized view for reverse lookups                                        |
 | `KV_ACCOUNTS_TABLE_NAME`     | `kv_accounts`         | Contract-to-writer mappings                                                  |
-| `ALL_ACCOUNTS_TABLE_NAME`    | `all_accounts`        | Unique accounts table (`predecessor_id text PRIMARY KEY`). Used by `scan=1`. |
+| `ALL_ACCOUNTS_TABLE_NAME`    | `all_accounts`        | Unique accounts table (`predecessor_id text PRIMARY KEY`). Used when `contractId` omitted. |
 | `KV_EDGES_TABLE_NAME`        | `kv_edges`            | Reverse edge lookup table                                                    |
 | `KV_REVERSE_TABLE_NAME`      | `kv_reverse`          | Reverse lookup by (contract, key) → writers                                  |
 | `PORT`                       | `3001`                | Server listen port                                                           |
@@ -726,7 +724,7 @@ kv_accounts     PRIMARY KEY ((current_account_id), key, predecessor_id)
                 Contract-to-writer mapping. Populated asynchronously (reads use LocalQuorum).
 
 all_accounts    PRIMARY KEY (predecessor_id)
-                One row per unique account. Used by scan=1 on /v1/kv/accounts. Populated by indexer.
+                One row per unique account. Used when contractId omitted on /v1/kv/accounts. Populated by indexer.
 
 kv_edges        PRIMARY KEY ((edge_type, target), source)
                 → block_height
@@ -760,7 +758,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 
 ## Prepared Statements
 
-22 statements prepared at startup. All use `LocalOne` consistency and 10s timeout unless noted.
+25 statements prepared at startup (2 optional). All use `LocalOne` consistency and 10s timeout unless noted.
 
 | Name                       | Table           | CQL Summary                                                         | Used By                                          |
 | -------------------------- | --------------- | ------------------------------------------------------------------- | ------------------------------------------------ |
@@ -780,8 +778,11 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 | `timeline_asc`             | `s_kv_by_block` | PK + `block_height >= ? AND <= ?` ORDER BY block_height ASC         | `/kv/timeline` (asc)                             |
 | `accounts_by_contract`     | `kv_accounts`   | Full partition (**LocalQuorum**)                     | `/kv/accounts` (no key)                          |
 | `accounts_by_contract_key` | `kv_accounts`   | PK+CK lookup (**LocalQuorum**)                       | `/kv/accounts` (with key)                        |
-| `accounts_all`             | `all_accounts`  | Full table scan (**LocalQuorum**)                    | `/kv/accounts` (scan=1, no cursor)               |
-| `accounts_all_cursor`      | `all_accounts`  | `TOKEN(predecessor_id) > TOKEN(?)` (**LocalQuorum**) | `/kv/accounts` (scan=1, with cursor)             |
+| `accounts_all`             | `all_accounts`  | Full table scan (**LocalQuorum**)                    | `/kv/accounts` (no contractId, no cursor)        |
+| `accounts_all_cursor`      | `all_accounts`  | `TOKEN(predecessor_id) > TOKEN(?)` (**LocalQuorum**) | `/kv/accounts` (no contractId, with cursor)      |
+| `contracts_all`            | `kv_accounts`   | `SELECT current_account_id` (**LocalQuorum**, app-level dedup) | `/kv/contracts` (no accountId, no cursor) |
+| `contracts_all_cursor`     | `kv_accounts`   | Same + `TOKEN(...) > TOKEN(?)` (**LocalQuorum**, app-level dedup) | `/kv/contracts` (no accountId, with cursor) |
+| `contracts_by_account`     | `s_kv_last`     | PK lookup (current_account_id, key)                  | `/kv/contracts` (with accountId)                 |
 | `edges_list`               | `kv_edges`      | Full partition                                       | `/kv/edges` (no cursor)                          |
 | `edges_list_cursor`        | `kv_edges`      | PK + `source > ?`                                    | `/kv/edges` (with cursor)                        |
 | `edges_count`              | `kv_edges`      | `COUNT(*)` full partition                            | `/kv/edges/count`                                |
@@ -798,7 +799,7 @@ kv_reverse      PRIMARY KEY ((current_account_id, key), predecessor_id)
 | `/v1/kv/query`                              | Full partition scan                             | Missing `key_prefix`          | Always provide `key_prefix`                |
 | `/v1/kv/timeline`                           | CQL-filtered partition scan                     | Wide block range or no filter | Use `from_block`/`to_block` + cursor       |
 | `/v1/kv/accounts` (contract)                | Full partition + 100k dedup                     | Missing `key` param           | Always provide `key`                       |
-| `/v1/kv/accounts` (scan)                    | Full table TOKEN scan                           | `scan=1` without `contractId` | Throttled 1 req/sec per IP, max 1000 rows  |
+| `/v1/kv/accounts` (scan)                    | Full table TOKEN scan                           | `contractId` omitted          | Throttled 1 req/sec per IP, max 1000 rows  |
 | `/v1/kv/edges`                              | Full partition + offset                         | Missing `after_source` cursor | Use cursor-based pagination                |
 | `/v1/kv/edges/count`                        | Full partition `COUNT(*)`                       | Any call                      | No mitigation; consider caching            |
 | `/v1/kv/writers`                            | Full partition stream                           | Popular keys (many writers)   | Use cursor pagination with tight `limit`   |

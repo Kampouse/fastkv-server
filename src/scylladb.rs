@@ -369,12 +369,12 @@ impl ScyllaDb {
             ).await?,
             contracts_all: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT DISTINCT current_account_id FROM {}", kv_accounts_table_name),
+                &format!("SELECT current_account_id FROM {}", kv_accounts_table_name),
                 scylla::frame::types::Consistency::LocalQuorum,
             ).await?,
             contracts_all_cursor: Self::prepare_query(
                 &scylla_session,
-                &format!("SELECT DISTINCT current_account_id FROM {} WHERE TOKEN(current_account_id) > TOKEN(?)", kv_accounts_table_name),
+                &format!("SELECT current_account_id FROM {} WHERE TOKEN(current_account_id) > TOKEN(?)", kv_accounts_table_name),
                 scylla::frame::types::Consistency::LocalQuorum,
             ).await?,
             contracts_by_account: Self::prepare_query(
@@ -715,8 +715,11 @@ impl ScyllaDb {
         Ok((page.items, page.has_more, page.dropped_rows))
     }
 
+    /// Returns true if the global contracts scan feature is available
+    /// (i.e., the SELECT DISTINCT prepared statements succeeded).
     /// Query all distinct contract IDs from the `kv_accounts` table.
     /// Uses TOKEN-based cursor for stable pagination across partitions.
+    /// Deduplicates consecutive rows with the same `current_account_id`.
     ///
     /// Returns `(contracts, has_more, dropped_rows)`.
     pub async fn query_all_contracts(
@@ -737,25 +740,30 @@ impl ScyllaDb {
                 .rows_stream::<ContractRow>()?,
         };
 
-        let mut skipped_cursor = false;
+        let after = after_contract.map(|s| s.to_string());
+        let mut past_cursor = after.is_none();
+        let mut last_contract: Option<String> = None;
         let page = collect_page(
             &mut rows_stream,
             limit,
             0,    // no offset — cursor handles resumption
             None, // overfetch mode
             |row: ContractRow| {
-                if !skipped_cursor {
-                    if let Some(c) = after_contract {
-                        if row.current_account_id == c {
-                            skipped_cursor = true;
-                            tracing::debug!(
-                                target: "fastkv-server",
-                                cursor = c,
-                                "Dropped cursor row reappearance (contracts)"
-                            );
-                            return None;
+                // Deduplicate: rows within a partition share the same current_account_id
+                if let Some(ref prev) = last_contract {
+                    if row.current_account_id == *prev {
+                        return None;
+                    }
+                }
+                last_contract = Some(row.current_account_id.clone());
+
+                if !past_cursor {
+                    if let Some(ref c) = after {
+                        if row.current_account_id == *c {
+                            return None; // skip cursor row reappearance
                         }
                     }
+                    past_cursor = true;
                 }
                 Some(row.current_account_id)
             },
@@ -1154,7 +1162,7 @@ impl ScyllaDb {
 }
 
 fn compute_prefix_end(prefix: &str) -> String {
-    format!("{prefix}\u{ff}")
+    format!("{prefix}\u{10ffff}")
 }
 
 fn effective_offset(cursor: Option<&str>, offset: usize) -> usize {
@@ -1288,8 +1296,8 @@ mod tests {
 
     #[test]
     fn test_compute_prefix_end() {
-        assert_eq!(compute_prefix_end("graph/follow/"), "graph/follow/\u{ff}");
-        assert_eq!(compute_prefix_end("test"), "test\u{ff}");
-        assert_eq!(compute_prefix_end(""), "\u{ff}");
+        assert_eq!(compute_prefix_end("graph/follow/"), "graph/follow/\u{10ffff}");
+        assert_eq!(compute_prefix_end("test"), "test\u{10ffff}");
+        assert_eq!(compute_prefix_end(""), "\u{10ffff}");
     }
 }

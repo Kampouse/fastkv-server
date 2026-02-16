@@ -16,6 +16,7 @@ pub const MAX_STREAM_ERRORS: usize = 10;
 pub const MAX_DEDUP_SCAN: usize = 100_000;
 pub const MAX_EDGE_TYPE_LENGTH: usize = 256;
 pub const MAX_SCAN_LIMIT: usize = 1000;
+pub const MAX_CURSOR_LENGTH: usize = 1024;
 pub const PROJECT_ID: &str = "near-garden";
 
 // Raw row from ScyllaDB s_kv_last (matches table schema exactly)
@@ -69,7 +70,7 @@ pub struct ContractAccountRow {
     pub predecessor_id: String,
 }
 
-// Row for DISTINCT contract listing from kv_accounts (partition key only)
+// Row for contract listing from kv_accounts (deduplicated in app code)
 #[derive(DeserializeRow, Debug, Clone)]
 pub struct ContractRow {
     pub current_account_id: String,
@@ -160,7 +161,7 @@ impl KvEntry {
             // No field filtering - return all fields
             serde_json::to_value(self).unwrap_or_else(|e| {
                 tracing::error!(target: "fastkv-server", error = %e, "Failed to serialize KvEntry");
-                serde_json::json!({"error": "serialization_failed"})
+                serde_json::Value::Null
             })
         }
     }
@@ -495,12 +496,9 @@ pub struct AccountsParams {
 // Accounts-by-contract query parameters
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct AccountsQueryParams {
-    /// Contract account. When omitted, requires scan=1 for a full table scan.
+    /// Contract account. When omitted, performs a full table scan (throttled).
     #[serde(rename = "contractId", default)]
     pub contract_id: Option<String>,
-    /// Opt-in for expensive full table scan (required when contractId is omitted).
-    #[serde(default)]
-    pub scan: Option<u8>,
     /// Optional key filter. Recommended for large contracts to avoid expensive full-partition scans.
     #[serde(default)]
     pub key: Option<String>,
@@ -521,7 +519,7 @@ pub struct AccountsQueryParams {
 #[derive(Deserialize, Clone, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct ContractsQueryParams {
     /// Optional: list contracts this account has written to (single-partition, cheap).
-    /// When omitted, lists all contracts globally (full scan, throttled, requires scan=1).
+    /// When omitted, lists all contracts globally (full scan, throttled).
     #[serde(rename = "accountId", default)]
     pub predecessor_id: Option<String>,
     #[serde(default = "default_limit")]
@@ -529,9 +527,6 @@ pub struct ContractsQueryParams {
     /// Cursor: return contracts after this value (TOKEN-ordered when global, lexicographic when per-account).
     #[serde(default)]
     pub after_contract: Option<String>,
-    /// Must be set to 1 to enable global contract listing (when accountId is omitted).
-    #[serde(default)]
-    pub scan: Option<u8>,
 }
 
 // Diff query parameters

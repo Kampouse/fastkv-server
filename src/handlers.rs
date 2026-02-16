@@ -3,25 +3,21 @@ use crate::scylladb::ScyllaDb;
 use crate::tree::build_tree;
 use crate::AppState;
 use actix_web::{get, post, web, HttpRequest, HttpResponse};
-use tokio::sync::RwLockReadGuard;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
-const THROTTLE_CLEANUP_THRESHOLD: usize = 1_000;
-const THROTTLE_EXPIRY: Duration = Duration::from_secs(600); // 10 minutes
+const THROTTLE_EXPIRY: Duration = Duration::from_secs(60);
 const MAX_THROTTLE_ENTRIES: usize = 50_000;
 
-pub(crate) async fn require_db(
-    state: &AppState,
-) -> Result<RwLockReadGuard<'_, ScyllaDb>, ApiError> {
-    let guard = state.scylladb.read().await;
-    if guard.is_none() {
-        return Err(ApiError::DatabaseUnavailable);
-    }
-    Ok(RwLockReadGuard::map(guard, |opt| {
-        opt.as_deref().expect("guarded by is_none check above")
-    }))
+pub(crate) async fn require_db(state: &AppState) -> Result<Arc<ScyllaDb>, ApiError> {
+    state
+        .scylladb
+        .read()
+        .await
+        .clone()
+        .ok_or(ApiError::DatabaseUnavailable)
 }
 
 /// Attempt to JSON-decode the `"value"` field in a serialized entry.
@@ -164,6 +160,9 @@ fn validate_prefix(prefix: &Option<String>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Extract client IP from X-Forwarded-For (rightmost entry = added by Railway's proxy).
+/// Correct for a single trusted proxy hop. If a CDN is added in front, this would
+/// need to skip additional hops from the right.
 fn extract_client_ip(req: &HttpRequest) -> String {
     req.headers()
         .get("X-Forwarded-For")
@@ -185,16 +184,15 @@ fn extract_client_ip(req: &HttpRequest) -> String {
         })
 }
 
+/// Prevents accidental repeated scan requests from a single client (courtesy limit, not a security boundary).
 fn check_scan_throttle(app_state: &AppState, ip: &str) -> Result<(), ApiError> {
     let mut throttle = app_state
         .scan_throttle
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
-    if throttle.len() > THROTTLE_CLEANUP_THRESHOLD {
-        let cutoff = now - THROTTLE_EXPIRY;
-        throttle.retain(|_, ts| *ts > cutoff);
-    }
+    let cutoff = now - THROTTLE_EXPIRY;
+    throttle.retain(|_, ts| *ts > cutoff);
     if let Some(last) = throttle.get(ip) {
         if now.duration_since(*last) < std::time::Duration::from_secs(1) {
             return Err(ApiError::TooManyRequests(
@@ -223,8 +221,8 @@ fn check_scan_throttle(app_state: &AppState, ip: &str) -> Result<(), ApiError> {
 )]
 #[get("/health")]
 pub async fn health_check(app_state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
-    let guard = app_state.scylladb.read().await;
-    match guard.as_ref() {
+    let db = app_state.scylladb.read().await.clone();
+    match db.as_ref() {
         Some(db) => match db.health_check().await {
             Ok(_) => Ok(HttpResponse::Ok().json(HealthResponse {
                 status: "ok".to_string(),
@@ -392,6 +390,11 @@ pub async fn history_kv_handler(
     validate_order(&query.order)?;
     validate_block_range(query.from_block, query.to_block)?;
     if let Some(ref c) = query.cursor {
+        if c.len() > MAX_CURSOR_LENGTH {
+            return Err(ApiError::InvalidParameter(
+                "cursor: exceeds max length".to_string(),
+            ));
+        }
         if !c.is_empty() {
             parse_history_cursor(c)?;
         }
@@ -481,15 +484,15 @@ pub async fn writers_handler(
     Ok(respond_paginated(entries, meta, &fields, decode))
 }
 
-/// List unique writer accounts for a contract (or across all contracts with `scan=1`).
+/// List unique writer accounts for a contract (or across all contracts).
 ///
 /// Returns deduplicated predecessor accounts that have written to the given contract.
 /// Providing a `key` filter is recommended — omitting it scans the entire contract partition
 /// which can be expensive for large contracts. Results are capped at 100,000 unique accounts;
 /// if this limit is reached the response will include `meta.truncated: true`.
 ///
-/// When `contractId` is omitted, `scan=1` is required. This performs an expensive full table
-/// scan across all contracts, throttled to 1 req/sec per IP. Limit is clamped to 1,000.
+/// When `contractId` is omitted, performs a full table scan throttled to 1 req/sec per IP.
+/// Limit is clamped to 1,000.
 #[utoipa::path(
     get,
     path = "/v1/kv/accounts",
@@ -512,12 +515,6 @@ pub async fn accounts_handler(
     let is_scan = contract_id.is_none();
 
     if is_scan {
-        // Full table scan: require explicit opt-in
-        if query.scan != Some(1) {
-            return Err(ApiError::InvalidParameter(
-                "contractId: required unless scan=1".to_string(),
-            ));
-        }
         if query.key.is_some() {
             return Err(ApiError::InvalidParameter(
                 "key: requires contractId".to_string(),
@@ -640,11 +637,6 @@ pub async fn contracts_handler(
         db.query_contracts_by_account(account_id, limit, query.after_contract.as_deref())
             .await?
     } else {
-        if query.scan != Some(1) {
-            return Err(ApiError::InvalidParameter(
-                "accountId: required unless scan=1".to_string(),
-            ));
-        }
         check_scan_throttle(&app_state, &extract_client_ip(&req))?;
 
         tracing::info!(
@@ -768,6 +760,11 @@ pub async fn timeline_kv_handler(
     validate_order(&query.order)?;
     validate_block_range(query.from_block, query.to_block)?;
     if let Some(ref c) = query.cursor {
+        if c.len() > MAX_CURSOR_LENGTH {
+            return Err(ApiError::InvalidParameter(
+                "cursor: exceeds max length".to_string(),
+            ));
+        }
         if !c.is_empty() {
             parse_timeline_cursor(c)?;
         }
@@ -859,8 +856,8 @@ pub async fn batch_kv_handler(
         let current_account_id = body.current_account_id.clone();
         let key = key.clone();
         async move {
-            let guard = scylladb.read().await;
-            let Some(db) = guard.as_ref() else {
+            let db = scylladb.read().await.clone();
+            let Some(ref db) = db else {
                 return BatchResultItem {
                     key,
                     found: false,
@@ -1039,12 +1036,12 @@ pub async fn watch_kv_handler(
         ));
     }
 
-    // Verify DB is available (rollback slot on failure)
-    let _ = require_db(&app_state).await.inspect_err(|_| {
-        app_state
-            .watch_count
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    })?;
+    // RAII guard: created immediately after incrementing watch_count so that
+    // early disconnects (before the stream is polled) still decrement.
+    let guard = WatchGuard(app_state.watch_count.clone());
+
+    // Verify DB is available (guard's Drop handles rollback on error)
+    let _ = require_db(&app_state).await?;
 
     tracing::info!(
         target: PROJECT_ID,
@@ -1063,16 +1060,15 @@ pub async fn watch_kv_handler(
         .and_then(|s| s.parse().ok());
 
     let scylladb = app_state.scylladb.clone();
-    let watch_count = app_state.watch_count.clone();
     let predecessor_id = query.predecessor_id.clone();
     let current_account_id = query.current_account_id.clone();
     let key = query.key.clone();
 
     let stream = async_stream::stream! {
+        let _guard = guard; // move RAII guard into the stream so it lives until disconnect
         let mut last_known_block = last_block.unwrap_or(0);
         let mut poll_interval = tokio::time::interval(Duration::from_secs(poll_secs));
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(SSE_HEARTBEAT_SECS));
-        let _guard = WatchGuard(watch_count.clone());
 
         loop {
             tokio::select! {
@@ -1143,8 +1139,8 @@ impl Drop for WatchGuard {
 )]
 #[get("/v1/status")]
 pub async fn status_handler(app_state: web::Data<AppState>) -> HttpResponse {
-    let guard = app_state.scylladb.read().await;
-    let indexer_block = match guard.as_ref() {
+    let db = app_state.scylladb.read().await.clone();
+    let indexer_block = match db.as_ref() {
         Some(db) => db.get_indexer_block_height().await.ok().flatten(),
         None => None,
     };

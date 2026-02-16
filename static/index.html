@@ -63,33 +63,26 @@
 
     <main>
       <div class="controls">
-        <div class="contract-row">
-          <label for="contract-input" class="label">contract</label>
-          <input
-            id="contract-input"
-            type="text"
-            placeholder="contextual.near"
-            spellcheck="false"
-            disabled
-          />
-          <label class="all-accounts-toggle" title="Query all contracts (slower)">
-            <input type="checkbox" id="all-contracts-check" />
-            <span>all</span>
-          </label>
-        </div>
-        <div class="contract-row">
-          <label for="account-input" class="label">account</label>
-          <input
-            id="account-input"
-            type="text"
-            placeholder="root.near"
-            spellcheck="false"
-            disabled
-          />
-          <label class="all-accounts-toggle" title="Query all accounts on this contract (slower)">
-            <input type="checkbox" id="all-accounts-check" checked />
-            <span>all</span>
-          </label>
+        <div class="field-rows">
+          <div class="contract-row" id="row-contract">
+            <label for="contract-input" class="label">contract</label>
+            <input
+              id="contract-input"
+              type="text"
+              placeholder="contextual.near"
+              spellcheck="false"
+            />
+          </div>
+          <button type="button" id="swap-btn" class="swap-btn" title="Swap grouping order">&#8645;</button>
+          <div class="contract-row" id="row-account">
+            <label for="account-input" class="label">account</label>
+            <input
+              id="account-input"
+              type="text"
+              placeholder="root.near"
+              spellcheck="false"
+            />
+          </div>
         </div>
         <form id="explore-form" class="search-row">
           <input

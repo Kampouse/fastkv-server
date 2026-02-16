@@ -134,7 +134,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 
 ## Prepared Statements
 
-- All CQL must be prepared in `ScyllaDb::new()`. No exceptions. 22 statements currently.
+- All CQL must be prepared in `ScyllaDb::new()`. No exceptions. 25 statements currently.
 - `queries.rs` owns only `compute_prefix_end()` (bind param computation, not dynamic CQL).
 - Default consistency: `LocalOne`. Exceptions require justification (see `accounts_by_contract` for `LocalQuorum`).
 - All statements get 10s request timeout via `set_request_timeout`.
@@ -144,7 +144,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 - `/v1/kv/query` without `key_prefix` — full partition scan. **Prefer `key_prefix` to narrow.**
 - `/v1/kv/timeline` — reads `s_kv_by_block` with CQL `ORDER BY` + cursor-based overfetch. **Use `from_block`/`to_block` to narrow and `cursor` for pagination.**
 - `/v1/kv/accounts` without `key` — full partition scan + HashSet dedup, capped at 100k unique. **Prefer `key` filter.**
-- `/v1/kv/accounts` without `contractId` (`scan=1`) — reads `all_accounts` table (no dedup needed, TOKEN-based cursor). Throttled 1 req/sec/IP, limit clamped to 1,000. **Admin/dev only.**
+- `/v1/kv/accounts` without `contractId` — reads `all_accounts` table (no dedup needed, TOKEN-based cursor). Courtesy-limited to 1 req/sec/IP to prevent accidental repeated scans, limit clamped to 1,000.
 - `/v1/kv/writers` — streams entire reverse table partition (unbounded, no scan cap). **Use cursor pagination with tight `limit`.**
 - `/v1/kv/edges/count` — `COUNT(*)` scans entire partition. **No mitigation; avoid in hot loops.**
 - `/v1/kv/watch` — SSE endpoint; polls `get_kv` per interval (2–30s). **Capped at 100 concurrent connections globally.** Uses `WatchGuard` RAII for cleanup.
@@ -157,7 +157,7 @@ Do not invent ad-hoc `serde_json::json!({...})` shapes for new endpoints. Use `P
 | `MAX_SOCIAL_RESULTS` | 1,000   | Per-pattern cap in social handlers. Controls `X-Results-Truncated`.                     |
 | `MAX_OFFSET`         | 100,000 | Hard ceiling on offset pagination.                                                      |
 | `MAX_BATCH_KEYS`     | 100     | Concurrent batch lookups (buffered 10 at a time).                                       |
-| `MAX_SCAN_LIMIT`     | 1,000   | Max `limit` for `/v1/kv/accounts` without `contractId` (`scan=1`).                      |
+| `MAX_SCAN_LIMIT`     | 1,000   | Max `limit` for `/v1/kv/accounts` without `contractId`.                                  |
 | `MAX_CONCURRENT_WATCHES` | 100 | Global cap on SSE `/v1/kv/watch` connections. Memory + DB polling bound.                |
 
 Full constant list in models.rs:1–20.

@@ -257,12 +257,13 @@ async fn main() -> std::io::Result<()> {
                                 header::HeaderValue::from(h),
                             );
                         }
-                        // Cache-Control for successful GET API responses
-                        if method == actix_web::http::Method::GET && res.status().is_success() {
-                            let cc = if path == "/health"
-                                || path == "/v1/status"
-                                || path.starts_with("/v1/kv/watch")
-                            {
+                        // Default Cache-Control for successful GET API responses.
+                        // Handlers that set their own Cache-Control header take precedence.
+                        if method == actix_web::http::Method::GET
+                            && res.status().is_success()
+                            && !res.headers().contains_key(header::CACHE_CONTROL)
+                        {
+                            let cc = if path == "/health" || path == "/v1/status" {
                                 "no-cache"
                             } else if path.starts_with("/v1/") {
                                 "public, max-age=5"
@@ -276,6 +277,15 @@ async fn main() -> std::io::Result<()> {
                                 );
                             }
                         }
+                        // Security headers on all responses.
+                        res.headers_mut().insert(
+                            header::HeaderName::from_static("x-content-type-options"),
+                            header::HeaderValue::from_static("nosniff"),
+                        );
+                        res.headers_mut().insert(
+                            header::HeaderName::from_static("x-frame-options"),
+                            header::HeaderValue::from_static("DENY"),
+                        );
                         Ok(res)
                     }
                 }
