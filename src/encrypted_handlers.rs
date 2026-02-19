@@ -6,10 +6,11 @@
 use crate::handlers::validate_account_id;
 use crate::models::*;
 use crate::AppState;
-use actix_web::{post, web, HttpResponse};
+use actix_web::{get, post, web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+const OUTLAYER_CONTRACT: &str = "outlayer.near";
 const OUTLAYER_API: &str = "https://api.outlayer.fastnear.com";
 const KEY_MANAGER_WASM: &str = "https://github.com/Kampouse/key-manager/releases/download/v0.2.0/key-manager.wasm";
 const KEY_MANAGER_HASH: &str = "44ce9f1f616e765f21fe208eb1ff4db29a7aac90096ca83cf75864793c21e7d3";
@@ -431,4 +432,338 @@ pub async fn encrypted_batch_encrypt_handler(
         }
         Err(e) => HttpResponse::BadRequest().json(e),
     }
+}
+
+// ============ Transaction-based Endpoints (No Payment Key) ============
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PrepareEncryptBody {
+    /// NEAR account ID (will sign and pay for transaction)
+    pub account_id: String,
+    /// Plaintext value to encrypt
+    pub value: String,
+    /// Optional group ID (defaults to account_id/private)
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PrepareDecryptBody {
+    /// NEAR account ID
+    pub account_id: String,
+    /// Ciphertext to decrypt
+    pub ciphertext: String,
+    /// Optional group ID
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PreparedTransaction {
+    /// NEAR transaction object to sign
+    pub transaction: NearTransactionJson,
+    /// URL to submit signed transaction (optional)
+    pub submit_url: String,
+    /// Instructions for signing
+    pub instructions: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NearTransactionJson {
+    /// Contract to call
+    pub receiver_id: String,
+    /// Method to call
+    pub method_name: String,
+    /// Arguments (base64 encoded)
+    pub args: String,
+    /// Deposit in yoctoNEAR
+    pub deposit: String,
+    /// Gas limit
+    pub gas: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ResultQuery {
+    /// Transaction hash from NEAR blockchain
+    pub tx_hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TransactionResult {
+    /// Success status
+    pub success: bool,
+    /// Encrypted/decrypted value (if successful)
+    pub result: Option<serde_json::Value>,
+    /// Error message (if failed)
+    pub error: Option<String>,
+}
+
+/// Prepare encrypt transaction
+///
+/// Returns an unsigned NEAR transaction for the user to sign.
+/// User signs and submits to NEAR blockchain (~0.001 NEAR cost).
+#[utoipa::path(
+    post,
+    path = "/v1/kv/encrypted/prepare-encrypt",
+    tag = "encrypted",
+    request_body = PrepareEncryptBody,
+    responses(
+        (status = 200, description = "Transaction prepared", body = PreparedTransaction),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+#[post("/v1/kv/encrypted/prepare-encrypt")]
+pub async fn encrypted_prepare_encrypt_handler(
+    body: web::Json<PrepareEncryptBody>,
+) -> HttpResponse {
+    let group_id = body
+        .group_id
+        .clone()
+        .unwrap_or_else(|| format!("{}/private", body.account_id));
+
+    // Validate
+    if let Err(e) = validate_account_id(&body.account_id, "account_id") {
+        return HttpResponse::BadRequest().json(ErrorResponse {
+            error: e.to_string(),
+            code: e.code(),
+        });
+    }
+
+    // Encode plaintext to base64
+    let plaintext_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body.value);
+
+    // Build OutLayer request
+    let input_data = serde_json::json!({
+        "action": "encrypt",
+        "group_id": group_id,
+        "account_id": body.account_id,
+        "plaintext_b64": plaintext_b64,
+    });
+
+    // Build NEAR transaction args
+    let tx_args = serde_json::json!({
+        "source": {
+            "WasmUrl": {
+                "url": KEY_MANAGER_WASM,
+                "hash": KEY_MANAGER_HASH,
+                "build_target": "wasm32-wasip1"
+            }
+        },
+        "input_data": serde_json::to_string(&input_data).unwrap_or_default(),
+        "resource_limits": {
+            "max_instructions": "10000000000",
+            "max_memory_mb": 128,
+            "max_execution_seconds": 60
+        },
+        "response_format": "Json"
+    });
+
+    let args_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        serde_json::to_vec(&tx_args).unwrap_or_default()
+    );
+
+    HttpResponse::Ok().json(PreparedTransaction {
+        transaction: NearTransactionJson {
+            receiver_id: OUTLAYER_CONTRACT.to_string(),
+            method_name: "request_execution".to_string(),
+            args: args_b64,
+            deposit: "50000000000000000000000".to_string(), // 0.05 NEAR
+            gas: "300000000000000".to_string(),
+        },
+        submit_url: "https://wallet.near.org/sign".to_string(),
+        instructions: "Sign this transaction with your NEAR wallet. Cost: ~0.05 NEAR".to_string(),
+    })
+}
+
+/// Prepare decrypt transaction
+///
+/// Returns an unsigned NEAR transaction for the user to sign.
+#[utoipa::path(
+    post,
+    path = "/v1/kv/encrypted/prepare-decrypt",
+    tag = "encrypted",
+    request_body = PrepareDecryptBody,
+    responses(
+        (status = 200, description = "Transaction prepared", body = PreparedTransaction),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+#[post("/v1/kv/encrypted/prepare-decrypt")]
+pub async fn encrypted_prepare_decrypt_handler(
+    body: web::Json<PrepareDecryptBody>,
+) -> HttpResponse {
+    let group_id = body
+        .group_id
+        .clone()
+        .unwrap_or_else(|| format!("{}/private", body.account_id));
+
+    // Validate
+    if let Err(e) = validate_account_id(&body.account_id, "account_id") {
+        return HttpResponse::BadRequest().json(ErrorResponse {
+            error: e.to_string(),
+            code: e.code(),
+        });
+    }
+
+    // Parse encrypted value format
+    let parts: Vec<&str> = body.ciphertext.split(':').collect();
+    let ciphertext_b64 = if parts.len() == 4 && parts[0] == "enc" && parts[1] == "AES256" {
+        parts[3].to_string()
+    } else {
+        body.ciphertext.clone()
+    };
+
+    // Build OutLayer request
+    let input_data = serde_json::json!({
+        "action": "decrypt",
+        "group_id": group_id,
+        "account_id": body.account_id,
+        "ciphertext_b64": ciphertext_b64,
+    });
+
+    // Build NEAR transaction args
+    let tx_args = serde_json::json!({
+        "source": {
+            "WasmUrl": {
+                "url": KEY_MANAGER_WASM,
+                "hash": KEY_MANAGER_HASH,
+                "build_target": "wasm32-wasip1"
+            }
+        },
+        "input_data": serde_json::to_string(&input_data).unwrap_or_default(),
+        "resource_limits": {
+            "max_instructions": "10000000000",
+            "max_memory_mb": 128,
+            "max_execution_seconds": 60
+        },
+        "response_format": "Json"
+    });
+
+    let args_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        serde_json::to_vec(&tx_args).unwrap_or_default()
+    );
+
+    HttpResponse::Ok().json(PreparedTransaction {
+        transaction: NearTransactionJson {
+            receiver_id: OUTLAYER_CONTRACT.to_string(),
+            method_name: "request_execution".to_string(),
+            args: args_b64,
+            deposit: "50000000000000000000000".to_string(), // 0.05 NEAR
+            gas: "300000000000000".to_string(),
+        },
+        submit_url: "https://wallet.near.org/sign".to_string(),
+        instructions: "Sign this transaction with your NEAR wallet. Cost: ~0.05 NEAR".to_string(),
+    })
+}
+
+/// Get transaction result
+///
+/// Fetches the result of a signed and submitted transaction.
+#[utoipa::path(
+    get,
+    path = "/v1/kv/encrypted/result",
+    tag = "encrypted",
+    params(
+        ("tx_hash" = String, Path, description = "Transaction hash")
+    ),
+    responses(
+        (status = 200, description = "Transaction result", body = TransactionResult),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
+#[get("/v1/kv/encrypted/result")]
+pub async fn encrypted_result_handler(
+    query: web::Query<ResultQuery>,
+) -> HttpResponse {
+    // Query NEAR RPC for transaction result
+    let client = reqwest::Client::new();
+    
+    let rpc_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "dontcare",
+        "method": "tx",
+        "params": [query.tx_hash, "kampouse.near"] // signer account for tx lookup
+    });
+
+    let response = match client
+        .post("https://rpc.mainnet.near.org")
+        .json(&rpc_request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ErrorResponse {
+                error: format!("RPC error: {}", e),
+                code: ErrorCode::DatabaseUnavailable,
+            });
+        }
+    };
+
+    let result: serde_json::Value = match response.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            return HttpResponse::BadRequest().json(ErrorResponse {
+                error: format!("Invalid RPC response: {}", e),
+                code: ErrorCode::InvalidParameter,
+            });
+        }
+    };
+
+    // Check for transaction status
+    if let Some(error) = result.get("error") {
+        return HttpResponse::Ok().json(TransactionResult {
+            success: false,
+            result: None,
+            error: Some(error.to_string()),
+        });
+    }
+
+    // Extract result from transaction receipts
+    if let Some(outcome) = result.get("result").and_then(|r| r.get("receipts_outcome")).and_then(|r| r.as_array()).and_then(|a| a.first()) {
+        if let Some(logs) = outcome.get("outcome").and_then(|o| o.get("logs")).and_then(|l| l.as_array()) {
+            // Look for JSON result in logs
+            for log in logs {
+                if let Some(log_str) = log.as_str() {
+                    if log_str.starts_with("{\"") {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(log_str) {
+                            // Check if it's an encrypt/decrypt result
+                            if parsed.get("ciphertext_b64").is_some() || parsed.get("plaintext_b64").is_some() {
+                                let key_id = parsed.get("key_id").and_then(|k| k.as_str()).unwrap_or("");
+                                
+                                if let Some(ct) = parsed.get("ciphertext_b64").and_then(|c| c.as_str()) {
+                                    return HttpResponse::Ok().json(TransactionResult {
+                                        success: true,
+                                        result: Some(serde_json::json!({
+                                            "encrypted_value": format!("enc:AES256:{}:{}", key_id, ct),
+                                            "key_id": key_id,
+                                            "attestation": parsed.get("attestation_hash")
+                                        })),
+                                        error: None,
+                                    });
+                                }
+                                
+                                if let Some(pt) = parsed.get("plaintext_utf8").and_then(|p| p.as_str()) {
+                                    return HttpResponse::Ok().json(TransactionResult {
+                                        success: true,
+                                        result: Some(serde_json::json!({
+                                            "plaintext": pt,
+                                            "key_id": key_id,
+                                        })),
+                                        error: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(TransactionResult {
+        success: true,
+        result: result.get("result").cloned(),
+        error: None,
+    })
 }

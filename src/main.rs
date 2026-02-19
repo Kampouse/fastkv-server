@@ -7,6 +7,7 @@ mod tree;
 
 use crate::encrypted_handlers::{
     encrypted_batch_encrypt_handler, encrypted_decrypt_handler, encrypted_encrypt_handler,
+    encrypted_prepare_encrypt_handler, encrypted_prepare_decrypt_handler, encrypted_result_handler,
 };
 use crate::handlers::{
     accounts_handler, batch_kv_handler, contracts_handler, diff_kv_handler, edges_count_handler,
@@ -60,6 +61,9 @@ use crate::models::PROJECT_ID;
         encrypted_handlers::encrypted_encrypt_handler,
         encrypted_handlers::encrypted_decrypt_handler,
         encrypted_handlers::encrypted_batch_encrypt_handler,
+        encrypted_handlers::encrypted_prepare_encrypt_handler,
+        encrypted_handlers::encrypted_prepare_decrypt_handler,
+        encrypted_handlers::encrypted_result_handler,
     ),
     components(schemas(
         models::KvEntry,
@@ -105,6 +109,12 @@ use crate::models::PROJECT_ID;
         encrypted_handlers::DecryptedResponse,
         encrypted_handlers::EncryptedBatchResponse,
         encrypted_handlers::EncryptedBatchItemResponse,
+        encrypted_handlers::PrepareEncryptBody,
+        encrypted_handlers::PrepareDecryptBody,
+        encrypted_handlers::PreparedTransaction,
+        encrypted_handlers::NearTransactionJson,
+        encrypted_handlers::ResultQuery,
+        encrypted_handlers::TransactionResult,
     )),
     info(
         title = "FastKV API",
@@ -335,6 +345,9 @@ async fn main() -> std::io::Result<()> {
             .service(encrypted_encrypt_handler)
             .service(encrypted_decrypt_handler)
             .service(encrypted_batch_encrypt_handler)
+            .service(encrypted_prepare_encrypt_handler)
+            .service(encrypted_prepare_decrypt_handler)
+            .service(encrypted_result_handler)
             .service(Files::new("/", "./static").index_file("index.html"))
     })
     .bind(format!("0.0.0.0:{}", port))?
