@@ -372,6 +372,18 @@ SCYLLA_SSL_KEY=/path/to/client-key.pem  # Client private key (for mTLS)
 
 When `SCYLLA_SSL_CA` is set, the server connects to ScyllaDB using TLS. If both `SCYLLA_SSL_CERT` and `SCYLLA_SSL_KEY` are also provided, mutual TLS (mTLS) authentication is enabled.
 
+**Optional (Database Connection):**
+
+```bash
+DB_FAIL_FAST=true                       # Exit immediately if DB unavailable (default: false)
+                                        # Recommended for Railway/Docker: enables auto-restart
+DB_MAX_RETRIES=10                       # Max reconnection attempts before exit (default: 0/unlimited)
+DB_RECONNECT_INTERVAL_SECS=5            # Base delay between retries (default: 5, min: 5)
+```
+
+- `DB_FAIL_FAST=true`: Blocks on startup until DB connection succeeds. If it fails, exits with error code (lets orchestrator restart container)
+- `DB_MAX_RETRIES=N`: After N failed background reconnect attempts, exits process. Set to avoid zombie containers
+
 **Optional (Advanced Configuration):**
 
 ```bash
@@ -387,11 +399,20 @@ REVERSE_VIEW_NAME=custom_mv             # Override reverse lookup view (default:
 
 ### Startup Requirements
 
-The server performs validation checks at startup and will exit immediately if:
+**Default behavior (DB_FAIL_FAST=false):**
+- Server starts immediately and connects to DB in background
+- API returns 503 until DB connection succeeds
+- Retries indefinitely with exponential backoff
 
+**Fail-fast mode (DB_FAIL_FAST=true):**
+- Server blocks until DB connection succeeds
+- Exits immediately if connection fails
+- Recommended for Railway/Docker: enables automatic container restart
+
+**Common startup failures:**
 - Required environment variables (`CHAIN_ID`, `SCYLLA_URL`, `SCYLLA_USERNAME`, `SCYLLA_PASSWORD`) are missing
 - `CHAIN_ID` is not a valid chain identifier
-- Cannot connect to ScyllaDB at the specified URL
+- Cannot connect to ScyllaDB at the specified URL (with DB_FAIL_FAST=true)
 - TLS certificates (if configured) cannot be read or are invalid
 - The specified keyspace does not exist
 
