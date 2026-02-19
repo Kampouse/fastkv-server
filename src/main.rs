@@ -165,41 +165,100 @@ async fn main() -> std::io::Result<()> {
     }
 
     let scylladb: Arc<RwLock<Option<Arc<ScyllaDb>>>> = Arc::new(RwLock::new(None));
-    tracing::info!(target: PROJECT_ID, "Database connection deferred to background task");
 
-    // Background reconnection task with exponential backoff
+    // Configuration for reconnection behavior
     let reconnect_base_secs: u64 = env::var("DB_RECONNECT_INTERVAL_SECS")
         .unwrap_or_else(|_| "5".to_string())
         .parse()
         .unwrap_or(5)
         .max(5);
     let reconnect_max_secs: u64 = 300;
+    let db_fail_fast: bool = env::var("DB_FAIL_FAST")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let db_max_retries: u64 = env::var("DB_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0); // 0 = unlimited
+
+    // Initial connection attempt (blocking if fail-fast is enabled)
+    if db_fail_fast {
+        tracing::info!(target: PROJECT_ID, "Attempting initial ScyllaDB connection (fail-fast mode)...");
+        let session = match ScyllaDb::new_scylla_session().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(target: PROJECT_ID, error = %e, "ScyllaDB connection failed on startup");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("ScyllaDB connection failed: {}", e)
+                ));
+            }
+        };
+        if let Err(e) = ScyllaDb::test_connection(&session).await {
+            tracing::error!(target: PROJECT_ID, error = %e, "ScyllaDB connection test failed on startup");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("ScyllaDB test failed: {}", e)
+            ));
+        }
+        match ScyllaDb::new(chain_id, session).await {
+            Ok(db) => {
+                *scylladb.write().await = Some(Arc::new(db));
+                tracing::info!(target: PROJECT_ID, "Successfully connected to ScyllaDB");
+            }
+            Err(e) => {
+                tracing::error!(target: PROJECT_ID, error = %e, "ScyllaDB initialization failed on startup");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("ScyllaDB init failed: {}", e)
+                ));
+            }
+        }
+    } else {
+        tracing::info!(target: PROJECT_ID, "Database connection deferred to background task");
+    }
+
+    // Background reconnection task with exponential backoff
     {
         let scylladb = Arc::clone(&scylladb);
         tokio::spawn(async move {
             let mut delay_secs = reconnect_base_secs;
-            let mut is_initial = true;
+            let mut retry_count: u64 = 0;
             loop {
-                if is_initial {
-                    is_initial = false;
-                } else {
+                // Skip delay on first iteration if we didn't do fail-fast
+                if retry_count > 0 || !db_fail_fast {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                 }
+                
                 if scylladb.read().await.is_some() {
                     delay_secs = reconnect_base_secs;
+                    retry_count = 0;
                     continue;
                 }
-                tracing::info!(target: PROJECT_ID, delay_secs, "Attempting to connect to ScyllaDB...");
+                
+                // Check max retries
+                if db_max_retries > 0 && retry_count >= db_max_retries {
+                    tracing::error!(
+                        target: PROJECT_ID,
+                        retries = retry_count,
+                        "Max DB reconnection attempts reached, exiting"
+                    );
+                    std::process::exit(1);
+                }
+                
+                retry_count += 1;
+                tracing::info!(target: PROJECT_ID, delay_secs, retry_count, "Attempting to connect to ScyllaDB...");
+                
                 let session = match ScyllaDb::new_scylla_session().await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB connection failed");
+                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, retry_count, "ScyllaDB connection failed");
                         delay_secs = (delay_secs * 2).min(reconnect_max_secs);
                         continue;
                     }
                 };
                 if let Err(e) = ScyllaDb::test_connection(&session).await {
-                    tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB connection test failed");
+                    tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, retry_count, "ScyllaDB connection test failed");
                     delay_secs = (delay_secs * 2).min(reconnect_max_secs);
                     continue;
                 }
@@ -207,10 +266,11 @@ async fn main() -> std::io::Result<()> {
                     Ok(db) => {
                         *scylladb.write().await = Some(Arc::new(db));
                         delay_secs = reconnect_base_secs;
+                        retry_count = 0;
                         tracing::info!(target: PROJECT_ID, "Successfully connected to ScyllaDB");
                     }
                     Err(e) => {
-                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, "ScyllaDB initialization failed");
+                        tracing::warn!(target: PROJECT_ID, error = %e, delay_secs, retry_count, "ScyllaDB initialization failed");
                         delay_secs = (delay_secs * 2).min(reconnect_max_secs);
                     }
                 }
