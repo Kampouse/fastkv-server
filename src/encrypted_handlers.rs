@@ -549,7 +549,7 @@ pub async fn encrypted_prepare_encrypt_handler(
         },
         "input_data": serde_json::to_string(&input_data).unwrap_or_default(),
         "resource_limits": {
-            "max_instructions": "10000000000",
+            "max_instructions": serde_json::Value::Number(10000000000u64.into()),
             "max_memory_mb": 128,
             "max_execution_seconds": 60
         },
@@ -631,7 +631,7 @@ pub async fn encrypted_prepare_decrypt_handler(
         },
         "input_data": serde_json::to_string(&input_data).unwrap_or_default(),
         "resource_limits": {
-            "max_instructions": "10000000000",
+            "max_instructions": serde_json::Value::Number(10000000000u64.into()),
             "max_memory_mb": 128,
             "max_execution_seconds": 60
         },
