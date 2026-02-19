@@ -1,9 +1,13 @@
+mod encrypted_handlers;
 mod handlers;
 mod models;
 mod scylladb;
 mod social_handlers;
 mod tree;
 
+use crate::encrypted_handlers::{
+    encrypted_batch_encrypt_handler, encrypted_decrypt_handler, encrypted_encrypt_handler,
+};
 use crate::handlers::{
     accounts_handler, batch_kv_handler, contracts_handler, diff_kv_handler, edges_count_handler,
     edges_handler, get_kv_handler, health_check, history_kv_handler, query_kv_handler,
@@ -53,6 +57,9 @@ use crate::models::PROJECT_ID;
         social_handlers::social_followers_handler,
         social_handlers::social_following_handler,
         social_handlers::social_account_feed_handler,
+        encrypted_handlers::encrypted_encrypt_handler,
+        encrypted_handlers::encrypted_decrypt_handler,
+        encrypted_handlers::encrypted_batch_encrypt_handler,
     ),
     components(schemas(
         models::KvEntry,
@@ -90,6 +97,14 @@ use crate::models::PROJECT_ID;
         models::PaginationMeta,
         models::WatchParams,
         models::WatchEvent,
+        encrypted_handlers::EncryptedSetBody,
+        encrypted_handlers::EncryptedGetBody,
+        encrypted_handlers::EncryptedBatchBody,
+        encrypted_handlers::EncryptedBatchItem,
+        encrypted_handlers::EncryptedResponse,
+        encrypted_handlers::DecryptedResponse,
+        encrypted_handlers::EncryptedBatchResponse,
+        encrypted_handlers::EncryptedBatchItemResponse,
     )),
     info(
         title = "FastKV API",
@@ -226,7 +241,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec!["GET", "POST"])
-            .allowed_headers(vec![header::CONTENT_TYPE, header::ACCEPT])
+            .allowed_headers(vec![header::CONTENT_TYPE, header::ACCEPT, header::HeaderName::from_static("x-payment-key")])
             .expose_headers(vec![
                 "X-Results-Truncated",
                 "X-Indexer-Block",
@@ -317,6 +332,9 @@ async fn main() -> std::io::Result<()> {
             .service(social_followers_handler)
             .service(social_following_handler)
             .service(social_account_feed_handler)
+            .service(encrypted_encrypt_handler)
+            .service(encrypted_decrypt_handler)
+            .service(encrypted_batch_encrypt_handler)
             .service(Files::new("/", "./static").index_file("index.html"))
     })
     .bind(format!("0.0.0.0:{}", port))?
